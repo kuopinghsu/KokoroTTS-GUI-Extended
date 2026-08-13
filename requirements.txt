@@ -1,0 +1,18 @@
+# Python deps for app.py
+gradio
+torch
+numpy
+nltk
+phonemizer
+soundfile
+kokoro>=0.9.4
+
+# Pulled in by kokoro (listed for clarity):
+# misaki[en], huggingface_hub, transformers, loguru
+
+# Optional (examples/ only, not required by app.py):
+# scipy
+
+# System packages (install separately, not via pip):
+# - espeak-ng   # required for phonemizer / misaki
+# - ffmpeg      # required for MP3 export (libmp3lame)
