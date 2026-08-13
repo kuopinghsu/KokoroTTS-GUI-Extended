@@ -1,8 +1,14 @@
 import gradio as gr
 import os
 import random
+import shutil
+import subprocess
+import tempfile
 import torch
 import time
+from pathlib import Path
+import numpy as np
+import soundfile as sf
 
 # --- MONKEY PATCH: Fix for 'EspeakWrapper' has no attribute 'set_data_path' ---
 # This block must run BEFORE importing kokoro or misaki.
@@ -27,13 +33,18 @@ try:
 except ImportError:
     raise ImportError("NLTK not found. Please install it using: pip install nltk")
 
-# Download NLTK 'punkt' model if not already present
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    print("DEBUG: NLTK 'punkt' tokenizer not found. Downloading...")
-    nltk.download('punkt')
-    print("DEBUG: Download complete.")
+# Download NLTK sentence tokenizer data if not already present.
+# Newer NLTK versions use 'punkt_tab'; older ones use 'punkt'.
+for resource, path in (
+    ("punkt_tab", "tokenizers/punkt_tab"),
+    ("punkt", "tokenizers/punkt"),
+):
+    try:
+        nltk.data.find(path)
+    except LookupError:
+        print(f"DEBUG: NLTK '{resource}' tokenizer not found. Downloading...")
+        nltk.download(resource)
+        print(f"DEBUG: Download of '{resource}' complete.")
 
 # --- NEW: Progress Logging ---
 def log_progress(message, level="INFO"):
@@ -329,6 +340,477 @@ def get_gatsby():
 def get_frankenstein():
     return load_text_file('frankenstein5k.md', "The Frankenstein text file was not found.")
 
+
+def load_dropped_text_file(file_path):
+    """Load text from a dragged/dropped file into the Single Text input."""
+    if not file_path:
+        return gr.update()
+    path = file_path if isinstance(file_path, str) else str(file_path)
+    path = path.strip().strip('"').strip("'")
+    if not path or not os.path.isfile(path):
+        return gr.update()
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            content = handle.read()
+    except UnicodeDecodeError:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            content = handle.read()
+    except OSError as exc:
+        log_progress(f"Failed to load dropped file {path}: {exc}", "ERROR")
+        return gr.update()
+    log_progress(f"Loaded text from {path} ({len(content)} chars)", "INFO")
+    return content
+
+# --- BATCH FILE LIST / CONVERSION ---
+
+TEXT_FILE_SUFFIXES = {'.txt', '.md', '.text', '.markdown'}
+
+
+def _to_wsl_path(path: str) -> str:
+    """Convert a Windows path to a WSL path when running under WSL."""
+    # C:\foo\bar or C:/foo/bar -> /mnt/c/foo/bar
+    if len(path) >= 3 and path[1] == ':' and path[0].isalpha() and path[2] in '\\/':
+        drive = path[0].lower()
+        rest = path[3:].replace('\\', '/')
+        return f'/mnt/{drive}/{rest}'
+    # \\wsl$\Distro\home\... already accessible differently; leave as-is
+    return path.replace('\\', '/')
+
+
+def _expand_path_entry(entry: str):
+    """Expand one pasted entry into concrete text-file paths.
+
+    Supports:
+    - a single file path
+    - a directory (all text files inside)
+    - a glob pattern (e.g. /path/*.txt)
+    """
+    import glob as _glob
+
+    entry = _to_wsl_path(entry.strip().strip('"').strip("'"))
+    if not entry or entry.startswith('#'):
+        return [], None
+
+    # Glob patterns
+    if any(ch in entry for ch in '*?['):
+        matches = sorted(
+            os.path.abspath(p)
+            for p in _glob.glob(entry)
+            if os.path.isfile(p)
+            and Path(p).suffix.lower() in TEXT_FILE_SUFFIXES
+        )
+        if not matches:
+            return [], f"no text files matched: {entry}"
+        return matches, None
+
+    abs_entry = os.path.abspath(entry)
+
+    if os.path.isdir(abs_entry):
+        files = []
+        for child in sorted(Path(abs_entry).iterdir()):
+            if child.is_file() and child.suffix.lower() in TEXT_FILE_SUFFIXES:
+                files.append(str(child.resolve()))
+        if not files:
+            for child in sorted(Path(abs_entry).rglob('*')):
+                if child.is_file() and child.suffix.lower() in TEXT_FILE_SUFFIXES:
+                    files.append(str(child.resolve()))
+        if not files:
+            return [], f"no text files in folder: {abs_entry}"
+        return files, None
+
+    if os.path.isfile(abs_entry):
+        suffix = Path(abs_entry).suffix.lower()
+        name = Path(abs_entry).name.lower()
+        # Manifest files: one path per line
+        if (
+            suffix in {'.list', '.files'}
+            or 'filelist' in name
+            or name.endswith('_batch.txt')
+            or name == 'batch.txt'
+        ):
+            expanded = []
+            try:
+                with open(abs_entry, 'r', encoding='utf-8') as handle:
+                    for sub in handle:
+                        sub = sub.strip().strip('"').strip("'")
+                        if not sub or sub.startswith('#'):
+                            continue
+                        sub_files, err = _expand_path_entry(sub)
+                        if sub_files:
+                            expanded.extend(sub_files)
+            except OSError as exc:
+                return [], f"cannot read manifest {abs_entry}: {exc}"
+            return expanded, None if expanded else f"empty manifest: {abs_entry}"
+
+        if suffix and suffix not in TEXT_FILE_SUFFIXES:
+            return [], f"unsupported type: {abs_entry}"
+        return [abs_entry], None
+
+    return [], f"not found: {entry}"
+
+
+def _normalize_path_list(paths):
+    """Flatten Gradio file values into a clean list of paths."""
+    if not paths:
+        return []
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    cleaned = []
+    for path in paths:
+        if not path:
+            continue
+        path = _to_wsl_path(str(path).strip().strip('"').strip("'"))
+        if path:
+            cleaned.append(os.path.abspath(path))
+    return cleaned
+
+
+def format_file_list(file_list):
+    if not file_list:
+        return "(no files added)"
+    return "\n".join(f"{i+1}. {path}" for i, path in enumerate(file_list))
+
+
+def add_files_to_list(current_list, uploaded_files):
+    """Append uploaded files to the batch list (skip duplicates)."""
+    current_list = list(current_list or [])
+    added = 0
+    skipped = 0
+    notes = []
+    for path in _normalize_path_list(uploaded_files):
+        suffix = Path(path).suffix.lower()
+        if suffix and suffix not in TEXT_FILE_SUFFIXES:
+            skipped += 1
+            notes.append(f"unsupported type: {path}")
+            continue
+        if not os.path.isfile(path):
+            skipped += 1
+            notes.append(f"not found: {path}")
+            continue
+        if path in current_list:
+            skipped += 1
+            notes.append(f"duplicate: {path}")
+            continue
+        current_list.append(path)
+        added += 1
+    status = f"Added {added} file(s). Total: {len(current_list)}."
+    if skipped:
+        status += f" Skipped {skipped}."
+        if notes:
+            status += "\n" + "\n".join(f"  - {n}" for n in notes[:20])
+            if len(notes) > 20:
+                status += f"\n  ... and {len(notes) - 20} more"
+    return current_list, format_file_list(current_list), status
+
+
+def add_paths_to_list(current_list, paths_text):
+    """Add paths pasted one-per-line (files, folders, or globs)."""
+    current_list = list(current_list or [])
+    if paths_text is None:
+        paths_text = ""
+    # Gradio may pass non-str in edge cases
+    paths_text = str(paths_text)
+    if not paths_text.strip():
+        return current_list, format_file_list(current_list), "No paths provided. Paste a file path, folder, or glob (one per line)."
+
+    collected = []
+    errors = []
+    for line in paths_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        files, err = _expand_path_entry(line)
+        if err:
+            errors.append(err)
+        if files:
+            collected.extend(files)
+
+    if not collected and errors:
+        return (
+            current_list,
+            format_file_list(current_list),
+            "Nothing added:\n" + "\n".join(f"  - {e}" for e in errors),
+        )
+
+    new_list, view, status = add_files_to_list(current_list, collected)
+    if errors:
+        status += "\nPath notes:\n" + "\n".join(f"  - {e}" for e in errors)
+    return new_list, view, status
+
+
+def clear_file_list():
+    return [], format_file_list([]), "File list cleared."
+
+
+def remove_selected_files(current_list, selected_indices_text):
+    """Remove 1-based indices from the list, e.g. '1,3,5' or '2-4'."""
+    current_list = list(current_list or [])
+    if not current_list:
+        return current_list, format_file_list(current_list), "List is empty."
+    if not selected_indices_text or not selected_indices_text.strip():
+        return current_list, format_file_list(current_list), "Enter indices to remove (e.g. 1,3 or 2-4)."
+
+    to_remove = set()
+    for token in selected_indices_text.replace(' ', '').split(','):
+        if not token:
+            continue
+        if '-' in token:
+            try:
+                start_s, end_s = token.split('-', 1)
+                start, end = int(start_s), int(end_s)
+                to_remove.update(range(start, end + 1))
+            except ValueError:
+                return current_list, format_file_list(current_list), f"Invalid range: {token}"
+        else:
+            try:
+                to_remove.add(int(token))
+            except ValueError:
+                return current_list, format_file_list(current_list), f"Invalid index: {token}"
+
+    new_list = [path for i, path in enumerate(current_list, start=1) if i not in to_remove]
+    removed = len(current_list) - len(new_list)
+    return new_list, format_file_list(new_list), f"Removed {removed} file(s)."
+
+
+def _ffmpeg_available():
+    return shutil.which("ffmpeg") is not None
+
+
+def save_audio_file(path_no_ext, sample_rate, audio_data, audio_format="wav"):
+    """Write audio to WAV or MP3. `path_no_ext` should not include the extension."""
+    audio_format = (audio_format or "wav").lower().lstrip(".")
+    audio_data = np.asarray(audio_data)
+    if audio_data.ndim > 1:
+        audio_data = np.squeeze(audio_data)
+
+    if audio_format == "wav":
+        out_path = f"{path_no_ext}.wav"
+        sf.write(out_path, audio_data, sample_rate)
+        return out_path
+
+    if audio_format == "mp3":
+        if not _ffmpeg_available():
+            raise RuntimeError(
+                "MP3 export requires ffmpeg on PATH (with libmp3lame). "
+                "Install ffmpeg or choose WAV."
+            )
+        out_path = f"{path_no_ext}.mp3"
+        # Encode via a temp WAV so we don't depend on pydub
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_wav = tmp.name
+        try:
+            sf.write(tmp_wav, audio_data, sample_rate)
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", tmp_wav,
+                    "-codec:a", "libmp3lame",
+                    "-qscale:a", "2",
+                    out_path,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+                raise RuntimeError(f"ffmpeg MP3 encode failed: {detail}")
+        finally:
+            try:
+                os.unlink(tmp_wav)
+            except OSError:
+                pass
+        return out_path
+
+    raise ValueError(f"Unsupported audio format: {audio_format}")
+
+
+def generate_with_export(
+    text,
+    voice,
+    speed,
+    use_gpu,
+    clean_lowercase,
+    clean_whitespace,
+    clean_references,
+    clean_initials,
+    parallel_chunks,
+    audio_format,
+):
+    """Generate audio for playback and also export a downloadable WAV/MP3 file."""
+    audio, ps = generate_first(
+        text,
+        voice,
+        speed,
+        use_gpu,
+        clean_lowercase,
+        clean_whitespace,
+        clean_references,
+        clean_initials,
+        parallel_chunks,
+    )
+    if audio is None:
+        return None, '', None
+
+    sample_rate, audio_data = audio
+    export_dir = tempfile.mkdtemp(prefix="kokoro_export_")
+    try:
+        export_path = save_audio_file(
+            os.path.join(export_dir, "kokoro_output"),
+            sample_rate,
+            audio_data,
+            audio_format,
+        )
+    except Exception as exc:
+        log_progress(f"Export failed: {exc}", "ERROR")
+        return audio, ps, None
+    return audio, ps, export_path
+
+
+def batch_convert(
+    file_list,
+    voice,
+    speed,
+    use_gpu,
+    clean_lowercase,
+    clean_whitespace,
+    clean_references,
+    clean_initials,
+    parallel_chunks,
+    output_dir,
+    audio_format,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Convert every text file in the list to WAV/MP3 using current voice settings."""
+    empty_player = gr.update(choices=[], value=None)
+    file_list = list(file_list or [])
+    if not file_list:
+        return "No files in the list. Add files first.", None, empty_player, None, []
+
+    audio_format = (audio_format or "wav").lower().lstrip(".")
+    if audio_format == "mp3" and not _ffmpeg_available():
+        return (
+            "MP3 export requires ffmpeg on PATH (with libmp3lame). "
+            "Install ffmpeg or choose WAV.",
+            None,
+            empty_player,
+            None,
+            [],
+        )
+
+    output_dir = (output_dir or "").strip() or "batch_output"
+    output_dir = os.path.abspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    log_progress(
+        f"Batch conversion started: {len(file_list)} file(s) → {output_dir} ({audio_format})",
+        "INFO",
+    )
+    written = []
+    errors = []
+
+    for i, path in enumerate(file_list):
+        name = os.path.basename(path)
+        progress((i) / len(file_list), desc=f"Converting {name}")
+        log_progress(f"Batch [{i+1}/{len(file_list)}]: {path}", "INFO")
+
+        if not os.path.isfile(path):
+            errors.append(f"{name}: file not found")
+            continue
+
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                text = handle.read()
+        except Exception as exc:
+            errors.append(f"{name}: read failed ({exc})")
+            continue
+
+        if not text.strip():
+            errors.append(f"{name}: empty file")
+            continue
+
+        try:
+            audio, _ps = generate_first(
+                text,
+                voice,
+                speed,
+                use_gpu,
+                clean_lowercase,
+                clean_whitespace,
+                clean_references,
+                clean_initials,
+                parallel_chunks,
+            )
+        except Exception as exc:
+            errors.append(f"{name}: generation failed ({exc})")
+            log_progress(f"Batch failed for {name}: {exc}", "ERROR")
+            continue
+
+        if audio is None:
+            errors.append(f"{name}: no audio generated")
+            continue
+
+        sample_rate, audio_data = audio
+        stem = Path(path).stem
+        path_no_ext = os.path.join(output_dir, stem)
+        # Avoid overwriting when multiple inputs share a stem
+        if os.path.exists(f"{path_no_ext}.{audio_format}"):
+            path_no_ext = os.path.join(output_dir, f"{stem}_{i+1}")
+        try:
+            out_path = save_audio_file(path_no_ext, sample_rate, audio_data, audio_format)
+            written.append(out_path)
+            log_progress(f"Wrote {out_path}", "INFO")
+        except Exception as exc:
+            errors.append(f"{name}: write failed ({exc})")
+
+    progress(1.0, desc="Done")
+    status_lines = [
+        f"Batch complete: {len(written)}/{len(file_list)} succeeded.",
+        f"Format: {audio_format.upper()}",
+        f"Output folder: {output_dir}",
+    ]
+    if written:
+        status_lines.append("Files:")
+        status_lines.extend(f"  ✓ {p}" for p in written)
+    if errors:
+        status_lines.append("Errors:")
+        status_lines.extend(f"  ✗ {e}" for e in errors)
+
+    status = "\n".join(status_lines)
+    log_progress(status, "INFO" if not errors else "WARN")
+
+    if not written:
+        return status, None, empty_player, None, []
+
+    choices = [(os.path.basename(p), p) for p in written]
+    first = written[0]
+    player_update = gr.update(choices=choices, value=first)
+    return status, written, player_update, first, written
+
+
+def play_batch_audio(selected_path):
+    """Load a completed batch output into the audio player."""
+    if not selected_path:
+        return None
+    path = str(selected_path)
+    if not os.path.isfile(path):
+        log_progress(f"Batch play: file not found: {path}", "WARN")
+        return None
+    return path
+
+
+def step_batch_audio(selected_path, written_files, direction):
+    """Move to previous/next completed batch file."""
+    written_files = list(written_files or [])
+    if not written_files:
+        return gr.update(), None
+    try:
+        idx = written_files.index(selected_path) if selected_path in written_files else 0
+    except ValueError:
+        idx = 0
+    idx = (idx + int(direction)) % len(written_files)
+    path = written_files[idx]
+    return gr.update(value=path), path
+
 # --- UI CONFIGURATION ---
 
 CHOICES = {
@@ -367,84 +849,435 @@ TOKEN_NOTE = '''💡 Customize pronunciation with Markdown link syntax and /slas
 ⬇️ Lower stress `[1 level](-1)` or `[2 levels](-2)`
 ⬆️ Raise stress 1 level `[or](+2)` 2 levels (only works on less stressed, usually short words)'''
 
+# --- THEME / CSS / JS ---
+
+KOKORO_THEME = gr.themes.Soft(
+    primary_hue="indigo",
+    secondary_hue="violet",
+    neutral_hue="slate",
+    font=gr.themes.GoogleFont("DM Sans"),
+    font_mono=gr.themes.GoogleFont("JetBrains Mono"),
+).set(
+    button_primary_background_fill="linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)",
+    button_primary_background_fill_hover="linear-gradient(135deg, #4338ca 0%, #6d28d9 100%)",
+    button_primary_text_color="white",
+    button_primary_border_color="transparent",
+    shadow_drop="0 8px 24px rgba(15, 23, 42, 0.08)",
+    shadow_drop_lg="0 16px 40px rgba(15, 23, 42, 0.12)",
+)
+
+APP_CSS = """
+:root {
+  --kokoro-radius: 16px;
+  --kokoro-gap: 14px;
+}
+.gradio-container {
+  max-width: 1280px !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  padding: 18px 18px 32px !important;
+  font-feature-settings: "ss01", "kern";
+}
+.app-header {
+  align-items: center !important;
+  margin-bottom: 8px;
+}
+.brand-title h1, .brand-title h2 {
+  margin: 0 !important;
+  letter-spacing: -0.03em;
+  font-weight: 700 !important;
+}
+.brand-title p {
+  margin: 4px 0 0 !important;
+  opacity: 0.72;
+  font-size: 0.95rem;
+}
+.theme-toggle {
+  justify-content: flex-end !important;
+  align-items: center !important;
+}
+.theme-toggle button {
+  min-width: 88px;
+  border-radius: 999px !important;
+}
+.settings-panel, .main-panel, .batch-card {
+  background: var(--block-background-fill);
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--kokoro-radius) !important;
+  padding: 14px 14px 8px !important;
+  box-shadow: var(--shadow-drop);
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  border: 1px solid var(--border-color-primary);
+  background: var(--block-background-fill);
+}
+.hw-ok { color: #059669; }
+.hw-cpu { color: #d97706; }
+.gradio-container .tabs {
+  margin-top: 4px;
+}
+button.primary, .generate-row button {
+  border-radius: 12px !important;
+}
+#theme-light, #theme-dark {
+  border-radius: 999px !important;
+}
+.dark #theme-dark,
+#theme-light {
+  font-weight: 700 !important;
+}
+.dark #theme-light {
+  font-weight: 500 !important;
+}
+.dark .settings-panel,
+.dark .main-panel,
+.dark .batch-card {
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+footer { display: none !important; }
+"""
+
+APP_JS = """
+function initKokoroTheme() {
+  const apply = (mode) => {
+    try { localStorage.setItem('kokoro-theme', mode); } catch (e) {}
+    const url = new URL(window.location);
+    if (url.searchParams.get('__theme') !== mode) {
+      url.searchParams.set('__theme', mode);
+      window.location.replace(url.href);
+    }
+  };
+  try {
+    const url = new URL(window.location);
+    const current = url.searchParams.get('__theme');
+    if (!current) {
+      const saved = localStorage.getItem('kokoro-theme');
+      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      apply(saved || (prefersDark ? 'dark' : 'light'));
+    } else {
+      localStorage.setItem('kokoro-theme', current);
+    }
+  } catch (e) {}
+  return 'theme-ready';
+}
+"""
+
+THEME_LIGHT_JS = """
+() => {
+  try { localStorage.setItem('kokoro-theme', 'light'); } catch (e) {}
+  const url = new URL(window.location);
+  url.searchParams.set('__theme', 'light');
+  window.location.href = url.href;
+}
+"""
+
+THEME_DARK_JS = """
+() => {
+  try { localStorage.setItem('kokoro-theme', 'dark'); } catch (e) {}
+  const url = new URL(window.location);
+  url.searchParams.set('__theme', 'dark');
+  window.location.href = url.href;
+}
+"""
+
+HARDWARE_BADGE = "CUDA GPU" if CUDA_AVAILABLE else "CPU"
+
 # --- GRADIO INTERFACE ---
 
-with gr.Blocks(title="Kokoro TTS Local") as app:
-    with gr.Row():
-        gr.Markdown("## Kokoro TTS (Local Windows Version)")
-    
-    with gr.Row():
-        with gr.Column():
-
-            text = gr.Textbox(label='Input Text', lines=5, value="Hello, this is a local test of Kokoro TTS on Windows.")
-            
+with gr.Blocks(title="Kokoro TTS") as app:
+    with gr.Row(elem_classes="app-header"):
+        with gr.Column(scale=5, elem_classes="brand-title"):
+            gr.Markdown(
+                f"# Kokoro TTS\n"
+                f"Local speech synthesis · **{HARDWARE_BADGE}**"
+            )
+        with gr.Column(scale=2, min_width=220, elem_classes="theme-toggle"):
             with gr.Row():
-                voice = gr.Dropdown(list(CHOICES.items()), value='af_heart', label='Voice')
-                speed = gr.Slider(minimum=0.5, maximum=2, value=1, step=0.1, label='Speed')
-            
-            with gr.Accordion("Text Cleaning Options", open=True):
-                clean_lowercase = gr.Checkbox(label="Convert to Lowercase", value=True)
-                clean_whitespace = gr.Checkbox(label="Normalize Whitespace", value=True)
-                clean_references = gr.Checkbox(label="Remove Reference Numbers (e.g., [1])", value=True)
-                clean_initials = gr.Checkbox(label="Format Initials (e.g., J.R.R.)", value=True)
+                light_btn = gr.Button("Light", elem_id="theme-light", variant="secondary")
+                dark_btn = gr.Button("Dark", elem_id="theme-dark", variant="secondary")
 
-            with gr.Accordion("Parallel Processing", open=True):
-                parallel_chunks = gr.Slider(minimum=1, maximum=10, value=5, step=1, label="Chunks to Process in Parallel")
-
-            with gr.Row():
-                # Hardware selection is visual only in this local version, logic is auto-handled
-                use_gpu = gr.Dropdown(
-                    [('GPU (Detected)' if CUDA_AVAILABLE else 'GPU (Not Found)', True), ('CPU', False)],
-                    value=CUDA_AVAILABLE,
-                    label='Hardware',
-                    interactive=False 
+    with gr.Row(equal_height=True):
+        with gr.Column(scale=1, min_width=280, elem_classes="settings-panel"):
+            gr.Markdown("### Voice")
+            voice = gr.Dropdown(list(CHOICES.items()), value='af_heart', label='Voice')
+            speed = gr.Slider(minimum=0.5, maximum=2, value=1, step=0.1, label='Speed')
+            audio_format = gr.Dropdown(
+                choices=['wav', 'mp3'],
+                value='wav',
+                label='Output Format',
+                info='MP3 requires ffmpeg (libmp3lame) on PATH',
+            )
+            use_gpu = gr.Dropdown(
+                [('GPU (Detected)' if CUDA_AVAILABLE else 'GPU (Not Found)', True), ('CPU', False)],
+                value=CUDA_AVAILABLE,
+                label='Hardware',
+                interactive=False,
+            )
+            with gr.Accordion("Text cleaning", open=False):
+                clean_lowercase = gr.Checkbox(label="Convert to lowercase", value=True)
+                clean_whitespace = gr.Checkbox(label="Normalize whitespace", value=True)
+                clean_references = gr.Checkbox(label="Remove reference numbers", value=True)
+                clean_initials = gr.Checkbox(label="Format initials (J.R.R.)", value=True)
+            with gr.Accordion("Performance", open=False):
+                parallel_chunks = gr.Slider(
+                    minimum=1, maximum=10, value=5, step=1,
+                    label="Parallel chunks",
+                    info="Lower this if you run out of memory",
                 )
-            
-            with gr.Row():
-                generate_btn = gr.Button('Generate', variant='primary')
-                stop_generate_btn = gr.Button('Stop', variant='stop')
-            out_audio = gr.Audio(label='Output Audio', interactive=False)
-            with gr.Accordion('Output Tokens', open=False):
-                out_ps = gr.Textbox(interactive=False, show_label=False)
-                tokenize_btn = gr.Button('Tokenize', variant='secondary')
-                gr.Markdown(TOKEN_NOTE)
 
-            with gr.Row():
-                random_btn = gr.Button('🎲 Random Quote', variant='secondary')
-                gatsby_btn = gr.Button('🥂 Gatsby', variant='secondary')
-                frankenstein_btn = gr.Button('💀 Frankenstein', variant='secondary')
+        with gr.Column(scale=3, elem_classes="main-panel"):
+            with gr.Tabs():
+                with gr.Tab("Single"):
+                    single_file = gr.File(
+                        label='Drop a .txt or .md file',
+                        file_count='single',
+                        file_types=['.txt', '.md', '.text', '.markdown'],
+                        type='filepath',
+                    )
+                    text = gr.Textbox(
+                        label='Input text',
+                        lines=8,
+                        value="Hello, this is a local test of Kokoro TTS.",
+                    )
+                    with gr.Row():
+                        random_btn = gr.Button('Random quote', variant='secondary')
+                        gatsby_btn = gr.Button('Gatsby', variant='secondary')
+                        frankenstein_btn = gr.Button('Frankenstein', variant='secondary')
+                    with gr.Row(elem_classes="generate-row"):
+                        generate_btn = gr.Button('Generate', variant='primary')
+                        stop_generate_btn = gr.Button('Stop', variant='stop')
+                    out_audio = gr.Audio(label='Output', interactive=False)
+                    out_file = gr.File(label='Download', interactive=False)
+                    with gr.Accordion('Phonemes / tokens', open=False):
+                        out_ps = gr.Textbox(interactive=False, show_label=False, lines=4)
+                        tokenize_btn = gr.Button('Tokenize', variant='secondary')
+                        gr.Markdown(TOKEN_NOTE)
 
-    # Event Handlers
+                with gr.Tab("Batch"):
+                    gr.Markdown(
+                        "Add `.txt` / `.md` files by upload, folder path, or glob "
+                        "(`~/text/*.txt`). Uses the voice settings on the left."
+                    )
+                    batch_files_state = gr.State([])
+                    batch_results_state = gr.State([])
+                    with gr.Row(equal_height=True):
+                        with gr.Column(elem_classes="batch-card"):
+                            batch_upload = gr.File(
+                                label='Add text files',
+                                file_count='multiple',
+                                file_types=['.txt', '.md', '.text', '.markdown'],
+                                type='filepath',
+                            )
+                            batch_paths = gr.Textbox(
+                                label='File or folder paths (one per line)',
+                                lines=4,
+                                placeholder='/home/kuoping/text\n/path/to/chapter1.txt\n/path/to/*.md',
+                            )
+                            with gr.Row():
+                                add_paths_btn = gr.Button('Add paths', variant='secondary')
+                                clear_list_btn = gr.Button('Clear', variant='secondary')
+                            batch_file_list_view = gr.Textbox(
+                                label='Queue',
+                                lines=8,
+                                value=format_file_list([]),
+                                interactive=False,
+                            )
+                            with gr.Row():
+                                remove_indices = gr.Textbox(
+                                    label='Remove by index',
+                                    placeholder='1,3 or 2-4',
+                                    scale=3,
+                                )
+                                remove_btn = gr.Button('Remove', variant='secondary', scale=1)
+
+                        with gr.Column(elem_classes="batch-card"):
+                            batch_output_dir = gr.Textbox(
+                                label='Output folder',
+                                value=str(Path('batch_output').resolve()),
+                            )
+                            with gr.Row():
+                                batch_convert_btn = gr.Button('Batch convert', variant='primary')
+                                stop_batch_btn = gr.Button('Stop', variant='stop')
+                            batch_status = gr.Textbox(label='Status', lines=8, interactive=False)
+                            batch_outputs = gr.File(
+                                label='Generated files',
+                                file_count='multiple',
+                                interactive=False,
+                            )
+                            with gr.Row():
+                                batch_play_select = gr.Dropdown(
+                                    label='Preview',
+                                    choices=[],
+                                    value=None,
+                                    interactive=True,
+                                )
+                                batch_prev_btn = gr.Button('Prev', variant='secondary', scale=0)
+                                batch_next_btn = gr.Button('Next', variant='secondary', scale=0)
+                            batch_audio = gr.Audio(
+                                label='Player',
+                                interactive=False,
+                                autoplay=True,
+                            )
+
+    # Event Handlers — Single Text
+    light_btn.click(fn=None, js=THEME_LIGHT_JS)
+    dark_btn.click(fn=None, js=THEME_DARK_JS)
+    single_file.change(fn=load_dropped_text_file, inputs=[single_file], outputs=[text])
     random_btn.click(fn=get_random_quote, inputs=[], outputs=[text])
     gatsby_btn.click(fn=get_gatsby, inputs=[], outputs=[text])
     frankenstein_btn.click(fn=get_frankenstein, inputs=[], outputs=[text])
-    
+
     generation_inputs = [
-        text, 
-        voice, 
-        speed, 
+        text,
+        voice,
+        speed,
         use_gpu,
         clean_lowercase,
         clean_whitespace,
         clean_references,
         clean_initials,
-        parallel_chunks
+        parallel_chunks,
+        audio_format,
     ]
-    
+
     tokenization_inputs = [
         text,
         voice,
         clean_lowercase,
         clean_whitespace,
         clean_references,
-        clean_initials
+        clean_initials,
     ]
-    
-    generation_event = generate_btn.click(fn=generate_first, inputs=generation_inputs, outputs=[out_audio, out_ps])
+
+    generation_event = generate_btn.click(
+        fn=generate_with_export,
+        inputs=generation_inputs,
+        outputs=[out_audio, out_ps, out_file],
+    )
     tokenize_btn.click(fn=tokenize_first, inputs=tokenization_inputs, outputs=[out_ps])
-    
     stop_generate_btn.click(fn=None, cancels=generation_event)
 
+    # Event Handlers — Batch Files
+    batch_upload.change(
+        fn=add_files_to_list,
+        inputs=[batch_files_state, batch_upload],
+        outputs=[batch_files_state, batch_file_list_view, batch_status],
+    )
+    add_paths_btn.click(
+        fn=add_paths_to_list,
+        inputs=[batch_files_state, batch_paths],
+        outputs=[batch_files_state, batch_file_list_view, batch_status],
+    )
+    clear_list_btn.click(
+        fn=clear_file_list,
+        inputs=[],
+        outputs=[batch_files_state, batch_file_list_view, batch_status],
+    )
+    remove_btn.click(
+        fn=remove_selected_files,
+        inputs=[batch_files_state, remove_indices],
+        outputs=[batch_files_state, batch_file_list_view, batch_status],
+    )
+
+    batch_inputs = [
+        batch_files_state,
+        voice,
+        speed,
+        use_gpu,
+        clean_lowercase,
+        clean_whitespace,
+        clean_references,
+        clean_initials,
+        parallel_chunks,
+        batch_output_dir,
+        audio_format,
+    ]
+    batch_event = batch_convert_btn.click(
+        fn=batch_convert,
+        inputs=batch_inputs,
+        outputs=[batch_status, batch_outputs, batch_play_select, batch_audio, batch_results_state],
+    )
+    stop_batch_btn.click(fn=None, cancels=batch_event)
+    batch_play_select.change(
+        fn=play_batch_audio,
+        inputs=[batch_play_select],
+        outputs=[batch_audio],
+    )
+    batch_prev_btn.click(
+        fn=lambda path, files: step_batch_audio(path, files, -1),
+        inputs=[batch_play_select, batch_results_state],
+        outputs=[batch_play_select, batch_audio],
+    )
+    batch_next_btn.click(
+        fn=lambda path, files: step_batch_audio(path, files, 1),
+        inputs=[batch_play_select, batch_results_state],
+        outputs=[batch_play_select, batch_audio],
+    )
+
+def _find_free_port(preferred=7860, fallback_start=17860, tries=100):
+    """Pick a bindable localhost port.
+
+    On some WSL/Windows setups, Gradio's default range (e.g. 7860+) is
+    reserved even when nothing is listening, so fall back to higher ports.
+    """
+    import socket
+
+    candidates = [preferred, *range(fallback_start, fallback_start + tries)]
+    for port in candidates:
+        with socket.socket() as sock:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise OSError(
+        f"Cannot find an empty port among {preferred} or "
+        f"{fallback_start}-{fallback_start + tries - 1}."
+    )
+
+
 if __name__ == '__main__':
-    # Launch in browser automatically
-    app.queue().launch(inbrowser=True)
+    # Launch in browser automatically. Prefer GRADIO_SERVER_PORT when it can bind;
+    # otherwise pick a free port (WSL/Windows often reserves Gradio's 7860 range).
+    import socket
+
+    env_port = os.getenv("GRADIO_SERVER_PORT")
+    server_port = None
+    if env_port:
+        candidate = int(env_port)
+        try:
+            with socket.socket() as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("127.0.0.1", candidate))
+            server_port = candidate
+        except OSError:
+            print(
+                f"WARN: Port {candidate} from GRADIO_SERVER_PORT is unavailable; "
+                "selecting a free port instead."
+            )
+    if server_port is None:
+        server_port = _find_free_port()
+    print(f"DEBUG: Launching Gradio on port {server_port}")
+    # Allow returning batch outputs from folders outside the project dir
+    # (Gradio only serves files from cwd/temp unless listed here).
+    allowed_paths = [
+        str(Path.cwd().resolve()),
+        str(Path.home().resolve()),
+        tempfile.gettempdir(),
+    ]
+    app.queue().launch(
+        inbrowser=True,
+        server_port=server_port,
+        allowed_paths=allowed_paths,
+        theme=KOKORO_THEME,
+        css=APP_CSS,
+        js=APP_JS,
+    )
