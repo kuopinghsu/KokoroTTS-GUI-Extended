@@ -3,6 +3,7 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import tempfile
 import torch
 import time
@@ -96,9 +97,66 @@ def forward_device(ps, ref_s, speed):
     return models[CUDA_AVAILABLE](ps, ref_s, speed)
 
 # --- PIPELINE SETUP ---
-pipelines = {lang_code: KPipeline(lang_code=lang_code, model=False) for lang_code in 'ab'}
-pipelines['a'].g2p.lexicon.golds['kokoro'] = 'kˈOkəɹO'
-pipelines['b'].g2p.lexicon.golds['kokoro'] = 'kˈQkəɹQ'
+REPO_ID = 'hexgrad/Kokoro-82M'
+LANG_EXTRAS = {'j': 'ja', 'z': 'zh'}
+pipelines = {}
+
+
+def _ensure_unidic():
+    """UniDic's pip package does not include MeCab dictionary files; download them once."""
+    try:
+        import unidic
+    except ImportError:
+        return
+    mecabrc = os.path.join(unidic.DICDIR, 'mecabrc')
+    if os.path.isfile(mecabrc):
+        return
+    print("DEBUG: UniDic dictionary missing. Downloading (this can take several minutes)...")
+    import unidic.download
+    unidic.download.download_version()
+    if not os.path.isfile(mecabrc):
+        raise RuntimeError(
+            "UniDic dictionary download failed. Run: "
+            f"{sys.executable} -m unidic download"
+        )
+    print("DEBUG: UniDic dictionary download complete.")
+
+
+def get_pipeline(lang_code):
+    """Return (and lazily create) a quiet KPipeline for the voice language."""
+    if lang_code in pipelines:
+        return pipelines[lang_code]
+    extra = LANG_EXTRAS.get(lang_code)
+    if lang_code == 'j':
+        _ensure_unidic()
+    try:
+        pipe = KPipeline(lang_code=lang_code, model=False, repo_id=REPO_ID)
+    except ImportError as exc:
+        if extra:
+            raise ImportError(
+                f"Language '{lang_code}' requires: pip install 'misaki[{extra}]'"
+            ) from exc
+        raise
+    if lang_code == 'a' and hasattr(pipe, 'g2p') and hasattr(pipe.g2p, 'lexicon'):
+        pipe.g2p.lexicon.golds['kokoro'] = 'kˈOkəɹO'
+    elif lang_code == 'b' and hasattr(pipe, 'g2p') and hasattr(pipe.g2p, 'lexicon'):
+        pipe.g2p.lexicon.golds['kokoro'] = 'kˈQkəɹQ'
+    pipelines[lang_code] = pipe
+    return pipe
+
+
+for _lang in 'ab':
+    get_pipeline(_lang)
+
+for _lang, _extra in LANG_EXTRAS.items():
+    try:
+        get_pipeline(_lang)
+        print(f"DEBUG: Loaded pipeline for lang_code='{_lang}' (misaki[{_extra}])")
+    except Exception as exc:
+        print(
+            f"WARN: { {'j': 'Japanese', 'z': 'Chinese'}[_lang] } voices unavailable. "
+            f"Install with: pip install 'misaki[{_extra}]'  ({exc})"
+        )
 
 # --- TEXT CHUNKING HELPERS (Adapted from Chatter.py) ---
 
@@ -157,13 +215,14 @@ def split_long_sentence(sentence, max_len=300, seps=None):
         
     return [c for c in chunks if c]
 
-def group_sentences(sentences, max_chars=280):
+def group_sentences(sentences, max_chars=280, joiner=" "):
     """
     Groups sentences into chunks of a specified maximum character length.
     """
     chunks = []
     current_chunk = []
     current_length = 0
+    sep_len = len(joiner)
 
     for sentence in sentences:
         sentence = sentence.strip()
@@ -174,30 +233,59 @@ def group_sentences(sentences, max_chars=280):
 
         if sentence_len > max_chars:
             if current_chunk:
-                chunks.append(" ".join(current_chunk))
+                chunks.append(joiner.join(current_chunk))
             
             # Split the oversized sentence and add its parts as separate chunks
             chunks.extend(split_long_sentence(sentence, max_chars))
             
             current_chunk = []
             current_length = 0
-        elif current_length + sentence_len + (1 if current_chunk else 0) <= max_chars:
+        elif current_length + sentence_len + (sep_len if current_chunk else 0) <= max_chars:
             current_chunk.append(sentence)
-            current_length += sentence_len + (1 if current_chunk else 0)
+            current_length += sentence_len + (sep_len if current_chunk else 0)
         else:
-            chunks.append(" ".join(current_chunk))
+            chunks.append(joiner.join(current_chunk))
             current_chunk = [sentence]
             current_length = sentence_len
 
     if current_chunk:
-        chunks.append(" ".join(current_chunk))
+        chunks.append(joiner.join(current_chunk))
 
     return chunks
+
+
+def split_sentences(text, lang_code):
+    """Split text into sentences, using CJK punctuation for Japanese/Chinese."""
+    if lang_code in ('j', 'z'):
+        parts = re.split(r'(?<=[。！？!?．…\n])', text)
+        sentences = [p.strip() for p in parts if p.strip()]
+        return sentences or [text.strip()]
+    return sent_tokenize(text)
+
+
+def prepare_text(text, voice, clean_lowercase, clean_whitespace, clean_references, clean_initials):
+    """Apply cleaning and chunking appropriate for the selected voice language."""
+    lang_code = voice[0]
+    english = lang_code in ('a', 'b')
+    if clean_lowercase and english:
+        text = text.lower()
+    if clean_whitespace:
+        text = normalize_whitespace(text)
+    if clean_references:
+        text = remove_inline_reference_numbers(text)
+    if clean_initials and english:
+        text = replace_letter_period_sequences(text)
+
+    sentences = split_sentences(text, lang_code)
+    max_chars = 80 if lang_code in ('j', 'z') else 280
+    joiner = '' if lang_code in ('j', 'z') else ' '
+    return group_sentences(sentences, max_chars=max_chars, joiner=joiner)
+
 
 def process_chunk(chunk_text, index, voice, speed):
     """Processes a single chunk of text to generate audio."""
     try:
-        pipeline = pipelines[voice[0]]
+        pipeline = get_pipeline(voice[0])
         pack = pipeline.load_voice(voice)
 
         chunk_text = chunk_text.strip()
@@ -237,20 +325,12 @@ def generate_first(text, voice, speed, use_gpu, clean_lowercase, clean_whitespac
         log_progress("Input text is empty. Aborting.", "WARN")
         return None, ''
 
-    # --- NEW: Apply text cleaning ---
+    # --- Apply text cleaning ---
     log_progress("Applying text cleaning options...", "DEBUG")
-    if clean_lowercase:
-        text = text.lower()
-    if clean_whitespace:
-        text = normalize_whitespace(text)
-    if clean_references:
-        text = remove_inline_reference_numbers(text)
-    if clean_initials:
-        text = replace_letter_period_sequences(text)
-
     log_progress("Splitting text into sentences and grouping into chunks...")
-    sentences = sent_tokenize(text)
-    chunks = group_sentences(sentences)
+    chunks = prepare_text(
+        text, voice, clean_lowercase, clean_whitespace, clean_references, clean_initials
+    )
     log_progress(f"Text divided into {len(chunks)} chunks for parallel processing.", "DEBUG")
 
     results = [None] * len(chunks)
@@ -295,21 +375,12 @@ def tokenize_first(text, voice, clean_lowercase, clean_whitespace, clean_referen
         return ''
     
     log_progress("Tokenizing first chunk for display...", "DEBUG")
-    # Apply same cleaning as generation to get accurate tokens
-    if clean_lowercase:
-        text = text.lower()
-    if clean_whitespace:
-        text = normalize_whitespace(text)
-    if clean_references:
-        text = remove_inline_reference_numbers(text)
-    if clean_initials:
-        text = replace_letter_period_sequences(text)
-
-    sentences = sent_tokenize(text)
-    chunks = group_sentences(sentences)
+    chunks = prepare_text(
+        text, voice, clean_lowercase, clean_whitespace, clean_references, clean_initials
+    )
     first_chunk = chunks[0] if chunks else ''
 
-    pipeline = pipelines[voice[0]]
+    pipeline = get_pipeline(voice[0])
     for _, ps, _ in pipeline(first_chunk, voice):
         return ps
     return ''
@@ -842,7 +913,33 @@ CHOICES = {
     '🇬🇧 🚹 Fable': 'bm_fable',
     '🇬🇧 🚹 Lewis': 'bm_lewis',
     '🇬🇧 🚹 Daniel': 'bm_daniel',
+    '🇯🇵 🚺 Alpha': 'jf_alpha',
+    '🇯🇵 🚺 Gongitsune': 'jf_gongitsune',
+    '🇯🇵 🚺 Nezumi': 'jf_nezumi',
+    '🇯🇵 🚺 Tebukuro': 'jf_tebukuro',
+    '🇯🇵 🚹 Kumo': 'jm_kumo',
+    '🇨🇳 🚺 Xiaobei': 'zf_xiaobei',
+    '🇨🇳 🚺 Xiaoni': 'zf_xiaoni',
+    '🇨🇳 🚺 Xiaoxiao': 'zf_xiaoxiao',
+    '🇨🇳 🚺 Xiaoyi': 'zf_xiaoyi',
+    '🇨🇳 🚹 Yunjian': 'zm_yunjian',
+    '🇨🇳 🚹 Yunxi': 'zm_yunxi',
+    '🇨🇳 🚹 Yunxia': 'zm_yunxia',
+    '🇨🇳 🚹 Yunyang': 'zm_yunyang',
 }
+
+VOICE_GROUPS = {
+    "All": list(CHOICES.items()),
+    "🇺🇸 English (US)": [(k, v) for k, v in CHOICES.items() if v.startswith('a')],
+    "🇬🇧 English (UK)": [(k, v) for k, v in CHOICES.items() if v.startswith('b')],
+    "🇯🇵 Japanese": [(k, v) for k, v in CHOICES.items() if v.startswith('j')],
+    "🇨🇳 Chinese": [(k, v) for k, v in CHOICES.items() if v.startswith('z')],
+}
+
+
+def voices_for_language(lang):
+    items = VOICE_GROUPS.get(lang) or list(CHOICES.items())
+    return gr.update(choices=items, value=items[0][1])
 
 TOKEN_NOTE = '''💡 Customize pronunciation with Markdown link syntax and /slashes/ like `[Kokoro](/kˈOkəɹO/)`
 💬 To adjust intonation, try punctuation `;:,.!?—…"()“”` or stress `ˈ` and `ˌ`
@@ -1006,7 +1103,18 @@ with gr.Blocks(title="Kokoro TTS") as app:
     with gr.Row(equal_height=True):
         with gr.Column(scale=1, min_width=280, elem_classes="settings-panel"):
             gr.Markdown("### Voice")
-            voice = gr.Dropdown(list(CHOICES.items()), value='af_heart', label='Voice')
+            voice_lang = gr.Dropdown(
+                list(VOICE_GROUPS.keys()),
+                value="All",
+                label="Language",
+            )
+            voice = gr.Dropdown(
+                list(CHOICES.items()),
+                value='af_heart',
+                label='Voice',
+                filterable=True,
+                info='Japanese: Alpha, Gongitsune, Nezumi, Tebukuro, Kumo. Chinese: Xiaobei, Xiaoni, Xiaoxiao, Xiaoyi, Yunjian, Yunxi, Yunxia, Yunyang.',
+            )
             speed = gr.Slider(minimum=0.5, maximum=2, value=1, step=0.1, label='Speed')
             audio_format = gr.Dropdown(
                 choices=['wav', 'mp3'],
@@ -1127,6 +1235,7 @@ with gr.Blocks(title="Kokoro TTS") as app:
                             )
 
     # Event Handlers — Single Text
+    voice_lang.change(fn=voices_for_language, inputs=[voice_lang], outputs=[voice])
     light_btn.click(fn=None, js=THEME_LIGHT_JS)
     dark_btn.click(fn=None, js=THEME_DARK_JS)
     single_file.change(fn=load_dropped_text_file, inputs=[single_file], outputs=[text])
@@ -1247,6 +1356,7 @@ def _find_free_port(preferred=7860, fallback_start=17860, tries=100):
 if __name__ == '__main__':
     # Launch in browser automatically. Prefer GRADIO_SERVER_PORT when it can bind;
     # otherwise pick a free port (WSL/Windows often reserves Gradio's 7860 range).
+    import signal
     import socket
 
     env_port = os.getenv("GRADIO_SERVER_PORT")
@@ -1273,6 +1383,23 @@ if __name__ == '__main__':
         str(Path.home().resolve()),
         tempfile.gettempdir(),
     ]
+
+    # First Ctrl-C warns; second Ctrl-C force-exits (Gradio/uvicorn often swallows SIGINT).
+    _interrupt_count = {"n": 0}
+
+    def _handle_interrupt(signum, frame):
+        _interrupt_count["n"] += 1
+        if _interrupt_count["n"] == 1:
+            print("\nPress Ctrl-C again to close the app.", flush=True)
+            return
+        print("\nClosing.", flush=True)
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _handle_interrupt)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_interrupt)
+
+    print("DEBUG: Press Ctrl-C twice to close the app.")
     app.queue().launch(
         inbrowser=True,
         server_port=server_port,

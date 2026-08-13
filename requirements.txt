@@ -6,6 +6,8 @@ nltk
 phonemizer
 soundfile
 kokoro>=0.9.4
+misaki[ja]
+misaki[zh]
 
 # Pulled in by kokoro (listed for clarity):
 # misaki[en], huggingface_hub, transformers, loguru

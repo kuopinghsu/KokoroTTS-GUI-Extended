@@ -6,7 +6,7 @@ A local Gradio interface for the **Kokoro** open-weight Text-to-Speech model. Ge
 
 ## Features
 
-* **High-quality TTS** — US & UK Kokoro voices
+* **High-quality TTS** — US, UK, Japanese, and Mandarin Chinese Kokoro voices
 * **Single Text tab** — type or drag-and-drop a `.txt` / `.md` file
 * **Batch Files tab** — build a file list (upload, paste paths, or a whole folder) and convert many files at once
 * **WAV / MP3 export** — choose output format (MP3 needs `ffmpeg`)
@@ -62,7 +62,7 @@ A local Gradio interface for the **Kokoro** open-weight Text-to-Speech model. Ge
 
    ```bash
    source .venv/bin/activate
-   python app.py
+   uv run python app.py
    ```
 
 2. The UI opens in your browser. Shared controls (voice, speed, cleaning, parallel chunks, output format) apply to both tabs.
@@ -88,7 +88,7 @@ A local Gradio interface for the **Kokoro** open-weight Text-to-Speech model. Ge
 
 | Control | Description |
 |---|---|
-| **Voice** | US / UK Kokoro voices |
+| **Voice** | US, UK, Japanese, and Mandarin Chinese Kokoro voices |
 | **Speed** | 0.5× – 2.0× |
 | **Output Format** | `wav` or `mp3` |
 | **Text Cleaning** | Lowercase, whitespace, references, initials |
@@ -101,9 +101,13 @@ On some WSL/Windows setups, ports in the 7000–9000 range are reserved. The app
 
 * **NLTK `punkt_tab` / `punkt`:** The app downloads these on startup. If that fails:
   ```bash
-  python -c "import nltk; nltk.download('punkt_tab'); nltk.download('punkt')"
+  uv run python -c "import nltk; nltk.download('punkt_tab'); nltk.download('punkt')"
   ```
-* **eSpeak / phonemizer errors:** Install `espeak-ng` and ensure it is on `PATH` (see Prerequisites). The app includes a small compatibility patch for newer phonemizer builds.
+* **Japanese MeCab / UniDic error (`mecabrc` not found):** `unidic` from pip/uv does not include the dictionary. Download it once:
+  ```bash
+  uv run python -m unidic download
+  ```
+  The app also tries to download this automatically the first time a Japanese voice is used.
 * **MP3 export fails:** Install `ffmpeg` with `libmp3lame`, or switch **Output Format** to `wav`.
 * **Gradio `InvalidPathError` when returning batch files:** The app allows serving files under your home directory. Restart after updating so `allowed_paths` is applied. Outputs are still written to your chosen folder even if the download widget fails.
 * **Port already in use / empty port range:** Unset a bad `GRADIO_SERVER_PORT`, or set one that can bind, e.g. `GRADIO_SERVER_PORT=17860 python app.py`.
