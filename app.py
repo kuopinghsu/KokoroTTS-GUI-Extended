@@ -80,14 +80,17 @@ print(f"DEBUG: Misaki Version: {misaki.__version__}")
 print(f"DEBUG: Running on {device.upper()}")
 
 # --- MODEL LOADING ---
-# For local use, we simply load one model onto the best available device.
-# We keep the dictionary structure for compatibility with existing functions,
-# but mapped to the same model instance to save VRAM.
+# v1.1-zh: Mandarin (55 female zf_*, 45 male zm_*) + 3 English bonus voices.
+# Ref: https://github.com/RapidAI/RapidSpeech.cpp/blob/main/docs/kokoro.md
+# Model: https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh
+REPO_ID = 'hexgrad/Kokoro-82M-v1.1-zh'
+ZH_G2P_VERSION = '1.1'
+print(f"DEBUG: Model repo: {REPO_ID}")
 print("Loading model... this may take a moment.")
 try:
-    model_instance = KModel().to(device).eval()
+    model_instance = KModel(repo_id=REPO_ID).to(device).eval()
 except Exception as e:
-    raise RuntimeError(f"Failed to load KModel. Do you have the model weights (kokoro-v0_19.pth) in this folder? Error: {e}")
+    raise RuntimeError(f"Failed to load KModel from {REPO_ID}. Error: {e}")
 
 models = {True: model_instance, False: model_instance} # True=GPU, False=CPU request (handled same locally)
 
@@ -97,8 +100,7 @@ def forward_device(ps, ref_s, speed):
     return models[CUDA_AVAILABLE](ps, ref_s, speed)
 
 # --- PIPELINE SETUP ---
-REPO_ID = 'hexgrad/Kokoro-82M'
-LANG_EXTRAS = {'j': 'ja', 'z': 'zh'}
+LANG_EXTRAS = {'z': 'zh'}
 pipelines = {}
 
 
@@ -127,10 +129,10 @@ def get_pipeline(lang_code):
     if lang_code in pipelines:
         return pipelines[lang_code]
     extra = LANG_EXTRAS.get(lang_code)
-    if lang_code == 'j':
-        _ensure_unidic()
     try:
         pipe = KPipeline(lang_code=lang_code, model=False, repo_id=REPO_ID)
+        if lang_code == 'z':
+            print(f"DEBUG: Chinese G2P is misaki[zh] ZHG2P(version='{ZH_G2P_VERSION}')")
     except ImportError as exc:
         if extra:
             raise ImportError(
@@ -154,8 +156,8 @@ for _lang, _extra in LANG_EXTRAS.items():
         print(f"DEBUG: Loaded pipeline for lang_code='{_lang}' (misaki[{_extra}])")
     except Exception as exc:
         print(
-            f"WARN: { {'j': 'Japanese', 'z': 'Chinese'}[_lang] } voices unavailable. "
-            f"Install with: pip install 'misaki[{_extra}]'  ({exc})"
+            f"WARN: Chinese voices unavailable. "
+            f"Install with: uv pip install 'misaki[{_extra}]'  ({exc})"
         )
 
 # --- TEXT CHUNKING HELPERS (Adapted from Chatter.py) ---
@@ -412,6 +414,10 @@ def get_frankenstein():
     return load_text_file('frankenstein5k.md', "The Frankenstein text file was not found.")
 
 
+def get_zh_sample():
+    return "你好，世界，今天天气真好。"
+
+
 def load_dropped_text_file(file_path):
     """Load text from a dragged/dropped file into the Single Text input."""
     if not file_path:
@@ -643,56 +649,71 @@ def remove_selected_files(current_list, selected_indices_text):
     return new_list, format_file_list(new_list), f"Removed {removed} file(s)."
 
 
+EXPORT_SAMPLE_RATE = 24000
+EXPORT_BITRATE = "32k"
+COMPRESSED_FORMATS = {"mp3", "aac"}
+
+
 def _ffmpeg_available():
     return shutil.which("ffmpeg") is not None
 
 
-def save_audio_file(path_no_ext, sample_rate, audio_data, audio_format="wav"):
-    """Write audio to WAV or MP3. `path_no_ext` should not include the extension."""
-    audio_format = (audio_format or "wav").lower().lstrip(".")
+def _to_mono(audio_data):
     audio_data = np.asarray(audio_data)
     if audio_data.ndim > 1:
-        audio_data = np.squeeze(audio_data)
+        audio_data = np.mean(audio_data, axis=-1)
+    return np.squeeze(audio_data)
 
-    if audio_format == "wav":
-        out_path = f"{path_no_ext}.wav"
-        sf.write(out_path, audio_data, sample_rate)
+
+def save_audio_file(path_no_ext, sample_rate, audio_data, audio_format="mp3"):
+    """Write 24 kHz mono audio as MP3, AAC, or WAV.
+
+    Compressed formats use 32 kbps. WAV is 16-bit PCM at 24 kHz mono.
+    """
+    audio_format = (audio_format or "mp3").lower().lstrip(".")
+    if audio_format not in {"mp3", "aac", "wav"}:
+        raise ValueError(f"Unsupported audio format: {audio_format}")
+
+    audio_data = _to_mono(audio_data)
+    out_path = f"{path_no_ext}.{audio_format}"
+
+    if audio_format == "wav" and not _ffmpeg_available():
+        sf.write(out_path, audio_data, EXPORT_SAMPLE_RATE if sample_rate == EXPORT_SAMPLE_RATE else sample_rate)
         return out_path
 
-    if audio_format == "mp3":
-        if not _ffmpeg_available():
-            raise RuntimeError(
-                "MP3 export requires ffmpeg on PATH (with libmp3lame). "
-                "Install ffmpeg or choose WAV."
-            )
-        out_path = f"{path_no_ext}.mp3"
-        # Encode via a temp WAV so we don't depend on pydub
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_wav = tmp.name
+    if audio_format in COMPRESSED_FORMATS and not _ffmpeg_available():
+        raise RuntimeError(
+            f"{audio_format.upper()} export requires ffmpeg on PATH. "
+            "Install ffmpeg or choose WAV."
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_wav = tmp.name
+    try:
+        sf.write(tmp_wav, audio_data, int(sample_rate))
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", tmp_wav,
+            "-ar", str(EXPORT_SAMPLE_RATE),
+            "-ac", "1",
+        ]
+        if audio_format == "mp3":
+            cmd.extend(["-codec:a", "libmp3lame", "-b:a", EXPORT_BITRATE])
+        elif audio_format == "aac":
+            cmd.extend(["-codec:a", "aac", "-b:a", EXPORT_BITRATE, "-f", "adts"])
+        else:
+            cmd.extend(["-codec:a", "pcm_s16le"])
+        cmd.append(out_path)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+            raise RuntimeError(f"ffmpeg {audio_format.upper()} encode failed: {detail}")
+    finally:
         try:
-            sf.write(tmp_wav, audio_data, sample_rate)
-            result = subprocess.run(
-                [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", tmp_wav,
-                    "-codec:a", "libmp3lame",
-                    "-qscale:a", "2",
-                    out_path,
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
-                raise RuntimeError(f"ffmpeg MP3 encode failed: {detail}")
-        finally:
-            try:
-                os.unlink(tmp_wav)
-            except OSError:
-                pass
-        return out_path
-
-    raise ValueError(f"Unsupported audio format: {audio_format}")
+            os.unlink(tmp_wav)
+        except OSError:
+            pass
+    return out_path
 
 
 def generate_with_export(
@@ -707,7 +728,7 @@ def generate_with_export(
     parallel_chunks,
     audio_format,
 ):
-    """Generate audio for playback and also export a downloadable WAV/MP3 file."""
+    """Generate audio for playback and also export a downloadable audio file."""
     audio, ps = generate_first(
         text,
         voice,
@@ -751,16 +772,16 @@ def batch_convert(
     audio_format,
     progress=gr.Progress(track_tqdm=False),
 ):
-    """Convert every text file in the list to WAV/MP3 using current voice settings."""
+    """Convert every text file in the list using current voice and export settings."""
     empty_player = gr.update(choices=[], value=None)
     file_list = list(file_list or [])
     if not file_list:
         return "No files in the list. Add files first.", None, empty_player, None, []
 
-    audio_format = (audio_format or "wav").lower().lstrip(".")
-    if audio_format == "mp3" and not _ffmpeg_available():
+    audio_format = (audio_format or "mp3").lower().lstrip(".")
+    if audio_format in COMPRESSED_FORMATS and not _ffmpeg_available():
         return (
-            "MP3 export requires ffmpeg on PATH (with libmp3lame). "
+            f"{audio_format.upper()} export requires ffmpeg on PATH. "
             "Install ffmpeg or choose WAV.",
             None,
             empty_player,
@@ -885,54 +906,31 @@ def step_batch_audio(selected_path, written_files, direction):
 # --- UI CONFIGURATION ---
 
 CHOICES = {
-    '🇺🇸 🚺 Heart ❤️': 'af_heart',
-    '🇺🇸 🚺 Bella 🔥': 'af_bella',
-    '🇺🇸 🚺 Nicole 🎧': 'af_nicole',
-    '🇺🇸 🚺 Aoede': 'af_aoede',
-    '🇺🇸 🚺 Kore': 'af_kore',
-    '🇺🇸 🚺 Sarah': 'af_sarah',
-    '🇺🇸 🚺 Nova': 'af_nova',
-    '🇺🇸 🚺 Sky': 'af_sky',
-    '🇺🇸 🚺 Alloy': 'af_alloy',
-    '🇺🇸 🚺 Jessica': 'af_jessica',
-    '🇺🇸 🚺 River': 'af_river',
-    '🇺🇸 🚹 Michael': 'am_michael',
-    '🇺🇸 🚹 Fenrir': 'am_fenrir',
-    '🇺🇸 🚹 Puck': 'am_puck',
-    '🇺🇸 🚹 Echo': 'am_echo',
-    '🇺🇸 🚹 Eric': 'am_eric',
-    '🇺🇸 🚹 Liam': 'am_liam',
-    '🇺🇸 🚹 Onyx': 'am_onyx',
-    '🇺🇸 🚹 Santa': 'am_santa',
-    '🇺🇸 🚹 Adam': 'am_adam',
-    '🇬🇧 🚺 Emma': 'bf_emma',
-    '🇬🇧 🚺 Isabella': 'bf_isabella',
-    '🇬🇧 🚺 Alice': 'bf_alice',
-    '🇬🇧 🚺 Lily': 'bf_lily',
-    '🇬🇧 🚹 George': 'bm_george',
-    '🇬🇧 🚹 Fable': 'bm_fable',
-    '🇬🇧 🚹 Lewis': 'bm_lewis',
-    '🇬🇧 🚹 Daniel': 'bm_daniel',
-    '🇯🇵 🚺 Alpha': 'jf_alpha',
-    '🇯🇵 🚺 Gongitsune': 'jf_gongitsune',
-    '🇯🇵 🚺 Nezumi': 'jf_nezumi',
-    '🇯🇵 🚺 Tebukuro': 'jf_tebukuro',
-    '🇯🇵 🚹 Kumo': 'jm_kumo',
-    '🇨🇳 🚺 Xiaobei': 'zf_xiaobei',
-    '🇨🇳 🚺 Xiaoni': 'zf_xiaoni',
-    '🇨🇳 🚺 Xiaoxiao': 'zf_xiaoxiao',
-    '🇨🇳 🚺 Xiaoyi': 'zf_xiaoyi',
-    '🇨🇳 🚹 Yunjian': 'zm_yunjian',
-    '🇨🇳 🚹 Yunxi': 'zm_yunxi',
-    '🇨🇳 🚹 Yunxia': 'zm_yunxia',
-    '🇨🇳 🚹 Yunyang': 'zm_yunyang',
+    '🇺🇸 🚺 Maple': 'af_maple',
+    '🇺🇸 🚺 Sol': 'af_sol',
+    '🇬🇧 🚺 Vale': 'bf_vale',
 }
+for _id in (
+    '001', '002', '003', '004', '005', '006', '007', '008', '017', '018', '019',
+    '021', '022', '023', '024', '026', '027', '028', '032', '036', '038', '039',
+    '040', '042', '043', '044', '046', '047', '048', '049', '051', '059', '060',
+    '067', '070', '071', '072', '073', '074', '075', '076', '077', '078', '079',
+    '083', '084', '085', '086', '087', '088', '090', '092', '093', '094', '099',
+):
+    CHOICES[f'🇨🇳 🚺 {_id}'] = f'zf_{_id}'
+for _id in (
+    '009', '010', '011', '012', '013', '014', '015', '016', '020', '025', '029',
+    '030', '031', '033', '034', '035', '037', '041', '045', '050', '052', '053',
+    '054', '055', '056', '057', '058', '061', '062', '063', '064', '065', '066',
+    '068', '069', '080', '081', '082', '089', '091', '095', '096', '097', '098',
+    '100',
+):
+    CHOICES[f'🇨🇳 🚹 {_id}'] = f'zm_{_id}'
 
 VOICE_GROUPS = {
     "All": list(CHOICES.items()),
     "🇺🇸 English (US)": [(k, v) for k, v in CHOICES.items() if v.startswith('a')],
     "🇬🇧 English (UK)": [(k, v) for k, v in CHOICES.items() if v.startswith('b')],
-    "🇯🇵 Japanese": [(k, v) for k, v in CHOICES.items() if v.startswith('j')],
     "🇨🇳 Chinese": [(k, v) for k, v in CHOICES.items() if v.startswith('z')],
 }
 
@@ -1093,7 +1091,7 @@ with gr.Blocks(title="Kokoro TTS") as app:
         with gr.Column(scale=5, elem_classes="brand-title"):
             gr.Markdown(
                 f"# Kokoro TTS\n"
-                f"Local speech synthesis · **{HARDWARE_BADGE}**"
+                f"v1.1-zh · Mandarin + English · 24 kHz · **{HARDWARE_BADGE}**"
             )
         with gr.Column(scale=2, min_width=220, elem_classes="theme-toggle"):
             with gr.Row():
@@ -1105,22 +1103,25 @@ with gr.Blocks(title="Kokoro TTS") as app:
             gr.Markdown("### Voice")
             voice_lang = gr.Dropdown(
                 list(VOICE_GROUPS.keys()),
-                value="All",
+                value="🇨🇳 Chinese",
                 label="Language",
             )
             voice = gr.Dropdown(
-                list(CHOICES.items()),
-                value='af_heart',
+                VOICE_GROUPS["🇨🇳 Chinese"],
+                value='zf_001',
                 label='Voice',
                 filterable=True,
-                info='Japanese: Alpha, Gongitsune, Nezumi, Tebukuro, Kumo. Chinese: Xiaobei, Xiaoni, Xiaoxiao, Xiaoyi, Yunjian, Yunxi, Yunxia, Yunyang.',
+                info='v1.1-zh: 55 female (zf_*) + 45 male (zm_*) Mandarin voices, plus Maple / Sol / Vale. Language follows the selected voice (misaki[zh] G2P 1.1).',
             )
-            speed = gr.Slider(minimum=0.5, maximum=2, value=1, step=0.1, label='Speed')
+            speed = gr.Slider(
+                minimum=0.5, maximum=2, value=1, step=0.1, label='Speed',
+                info='Duration scale. Values outside 0.7–1.3 may distort prosody.',
+            )
             audio_format = gr.Dropdown(
-                choices=['wav', 'mp3'],
-                value='wav',
+                choices=['mp3', 'aac', 'wav'],
+                value='mp3',
                 label='Output Format',
-                info='MP3 requires ffmpeg (libmp3lame) on PATH',
+                info='24 kHz / mono / 32 kbps (WAV is 16-bit PCM). MP3 and AAC need ffmpeg.',
             )
             use_gpu = gr.Dropdown(
                 [('GPU (Detected)' if CUDA_AVAILABLE else 'GPU (Not Found)', True), ('CPU', False)],
@@ -1152,9 +1153,10 @@ with gr.Blocks(title="Kokoro TTS") as app:
                     text = gr.Textbox(
                         label='Input text',
                         lines=8,
-                        value="Hello, this is a local test of Kokoro TTS.",
+                        value="你好，世界，今天天气真好。",
                     )
                     with gr.Row():
+                        zh_sample_btn = gr.Button('中文示例', variant='secondary')
                         random_btn = gr.Button('Random quote', variant='secondary')
                         gatsby_btn = gr.Button('Gatsby', variant='secondary')
                         frankenstein_btn = gr.Button('Frankenstein', variant='secondary')
@@ -1239,6 +1241,7 @@ with gr.Blocks(title="Kokoro TTS") as app:
     light_btn.click(fn=None, js=THEME_LIGHT_JS)
     dark_btn.click(fn=None, js=THEME_DARK_JS)
     single_file.change(fn=load_dropped_text_file, inputs=[single_file], outputs=[text])
+    zh_sample_btn.click(fn=get_zh_sample, inputs=[], outputs=[text])
     random_btn.click(fn=get_random_quote, inputs=[], outputs=[text])
     gatsby_btn.click(fn=get_gatsby, inputs=[], outputs=[text])
     frankenstein_btn.click(fn=get_frankenstein, inputs=[], outputs=[text])

@@ -1,12 +1,13 @@
 # Kokoro TTS Local Web UI (Extended)
 
-A local Gradio interface for the **Kokoro** open-weight Text-to-Speech model. Generate high-quality speech with parallel chunk processing, text cleaning, batch file conversion, and WAV/MP3 export.
+A local Gradio interface for **[Kokoro v1.1-zh](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)** (StyleTTS2 + iSTFTNet, 82M params, 24 kHz). Mandarin Chinese is the primary language; English Maple / Sol / Vale voices are included as bonus packs. See the [RapidSpeech Kokoro guide](https://github.com/RapidAI/RapidSpeech.cpp/blob/main/docs/kokoro.md) for architecture and G2P notes.
 
 <img width="1138" height="1283" alt="image" src="https://github.com/user-attachments/assets/3d4b74d2-33d8-4cef-ad4e-bc507d490270" />
 
 ## Features
 
-* **High-quality TTS** — US, UK, Japanese, and Mandarin Chinese Kokoro voices
+* **High-quality TTS** — Kokoro **v1.1-zh**: 55 female + 45 male Mandarin voices (`zf_*` / `zm_*`) plus English Maple, Sol, and Vale
+* **Chinese G2P** — `misaki[zh]` `ZHG2P(version='1.1')` (bopomofo phonemes, jieba + pypinyin + tone sandhi)
 * **Single Text tab** — type or drag-and-drop a `.txt` / `.md` file
 * **Batch Files tab** — build a file list (upload, paste paths, or a whole folder) and convert many files at once
 * **WAV / MP3 export** — choose output format (MP3 needs `ffmpeg`)
@@ -15,7 +16,7 @@ A local Gradio interface for the **Kokoro** open-weight Text-to-Speech model. Ge
 * **Hardware acceleration** — uses NVIDIA CUDA when available, otherwise CPU
 * **Text preprocessing** — lowercase, whitespace normalize, reference-number removal, initials formatting
 * **Tokenization preview** — inspect phonemes before synthesis
-* **Sample library** — Random Quote, Gatsby, Frankenstein shortcuts
+* **Sample library** — 中文示例, Random Quote, Gatsby, Frankenstein
 
 ## Prerequisites
 
@@ -54,7 +55,7 @@ A local Gradio interface for the **Kokoro** open-weight Text-to-Speech model. Ge
 
    For a specific CUDA build of PyTorch, install Torch from [pytorch.org](https://pytorch.org/) first, then run the command above.
 
-   Model weights are downloaded automatically from Hugging Face on first run (`hexgrad/Kokoro-82M`). Setting `HF_TOKEN` is optional but helps with Hub rate limits.
+   Model weights are downloaded automatically from Hugging Face on first run (`hexgrad/Kokoro-82M-v1.1-zh`). Setting `HF_TOKEN` is optional but helps with Hub rate limits.
 
 ## Usage
 
@@ -88,8 +89,8 @@ A local Gradio interface for the **Kokoro** open-weight Text-to-Speech model. Ge
 
 | Control | Description |
 |---|---|
-| **Voice** | US, UK, Japanese, and Mandarin Chinese Kokoro voices |
-| **Speed** | 0.5× – 2.0× |
+| **Voice** | v1.1-zh Mandarin speakers (`zf_` / `zm_`) plus Maple, Sol, Vale |
+| **Speed** | Duration scale (0.5×–2.0×). Values outside 0.7–1.3 may distort prosody |
 | **Output Format** | `wav` or `mp3` |
 | **Text Cleaning** | Lowercase, whitespace, references, initials |
 | **Parallel chunks** | 1–10 concurrent chunk workers (lower if you hit OOM) |
@@ -103,11 +104,11 @@ On some WSL/Windows setups, ports in the 7000–9000 range are reserved. The app
   ```bash
   uv run python -c "import nltk; nltk.download('punkt_tab'); nltk.download('punkt')"
   ```
-* **Japanese MeCab / UniDic error (`mecabrc` not found):** `unidic` from pip/uv does not include the dictionary. Download it once:
+* **Chinese voices unavailable:** Install G2P extras, then restart:
   ```bash
-  uv run python -m unidic download
+  uv pip install "misaki[zh]"
   ```
-  The app also tries to download this automatically the first time a Japanese voice is used.
+  This build is **Kokoro v1.1-zh** (English + Mandarin). Japanese and the old v1.0 named voices (Heart, Xiaoxiao, …) are not in this checkpoint.
 * **MP3 export fails:** Install `ffmpeg` with `libmp3lame`, or switch **Output Format** to `wav`.
 * **Gradio `InvalidPathError` when returning batch files:** The app allows serving files under your home directory. Restart after updating so `allowed_paths` is applied. Outputs are still written to your chosen folder even if the download widget fails.
 * **Port already in use / empty port range:** Unset a bad `GRADIO_SERVER_PORT`, or set one that can bind, e.g. `GRADIO_SERVER_PORT=17860 python app.py`.
