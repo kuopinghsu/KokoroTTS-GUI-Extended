@@ -1,13 +1,20 @@
 # Kokoro TTS Local Web UI (Extended)
 
-A local Gradio interface for **[Kokoro v1.1-zh](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)** (StyleTTS2 + iSTFTNet, 82M params, 24 kHz). Mandarin Chinese is the primary language; English Maple / Sol / Vale voices are included as bonus packs. See the [RapidSpeech Kokoro guide](https://github.com/RapidAI/RapidSpeech.cpp/blob/main/docs/kokoro.md) for architecture and G2P notes.
+A local Gradio interface for Kokoro (StyleTTS2 + iSTFTNet, 82M params, 24 kHz). Switch checkpoints in the UI:
+
+* **[v1.0](https://huggingface.co/hexgrad/Kokoro-82M)** — more US/UK English and Japanese voices, plus 8 older Chinese names
+* **[v1.1-zh](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)** — 100 Mandarin speakers, plus English Maple / Sol / Vale
+
+See the [RapidSpeech Kokoro guide](https://github.com/RapidAI/RapidSpeech.cpp/blob/main/docs/kokoro.md) for architecture and G2P notes.
 
 <img width="1138" height="1283" alt="image" src="https://github.com/user-attachments/assets/3d4b74d2-33d8-4cef-ad4e-bc507d490270" />
 
 ## Features
 
-* **High-quality TTS** — Kokoro **v1.1-zh**: 55 female + 45 male Mandarin voices (`zf_*` / `zm_*`) plus English Maple, Sol, and Vale
-* **Chinese G2P** — `misaki[zh]` `ZHG2P(version='1.1')` (bopomofo phonemes, jieba + pypinyin + tone sandhi)
+* **Two checkpoints** — switch in the UI:
+  * **v1.0 舊版** (`hexgrad/Kokoro-82M`): more US/UK English + Japanese + 8 older Chinese names
+  * **v1.1-zh** (`hexgrad/Kokoro-82M-v1.1-zh`): 55 female + 45 male Mandarin voices, plus Maple / Sol / Vale
+* **Chinese G2P (v1.1-zh)** — `misaki[zh]` `ZHG2P(version='1.1')`
 * **Single Text tab** — type or drag-and-drop a `.txt` / `.md` file
 * **Batch Files tab** — build a file list (upload, paste paths, or a whole folder) and convert many files at once
 * **WAV / MP3 export** — choose output format (MP3 needs `ffmpeg`)
@@ -55,7 +62,7 @@ A local Gradio interface for **[Kokoro v1.1-zh](https://huggingface.co/hexgrad/K
 
    For a specific CUDA build of PyTorch, install Torch from [pytorch.org](https://pytorch.org/) first, then run the command above.
 
-   Model weights are downloaded automatically from Hugging Face on first run (`hexgrad/Kokoro-82M-v1.1-zh`). Setting `HF_TOKEN` is optional but helps with Hub rate limits.
+   Model weights are downloaded from Hugging Face on first use of each checkpoint (`hexgrad/Kokoro-82M` for v1.0, `hexgrad/Kokoro-82M-v1.1-zh` for Chinese). Setting `HF_TOKEN` is optional but helps with Hub rate limits.
 
 ## Usage
 
@@ -66,7 +73,12 @@ A local Gradio interface for **[Kokoro v1.1-zh](https://huggingface.co/hexgrad/K
    uv run python app.py
    ```
 
-2. The UI opens in your browser. Shared controls (voice, speed, cleaning, parallel chunks, output format) apply to both tabs.
+2. The UI opens in your browser. Shared controls (model, voice, speed, cleaning, parallel chunks, output format) apply to both tabs.
+
+3. **Choose a checkpoint** with the **Model** dropdown (left panel):
+   * **v1.0 舊版** — Heart, Bella, Emma, Japanese Alpha / Kumo, older Xiaoxiao / Yunxi, …
+   * **v1.1-zh** — 55 female (`zf_*`) + 45 male (`zm_*`) Mandarin voices, plus Maple / Sol / Vale
+   Switching reloads weights (first time downloads from Hugging Face). Then pick **Language** and **Voice**.
 
 ### Single Text
 
@@ -89,7 +101,8 @@ A local Gradio interface for **[Kokoro v1.1-zh](https://huggingface.co/hexgrad/K
 
 | Control | Description |
 |---|---|
-| **Voice** | v1.1-zh Mandarin speakers (`zf_` / `zm_`) plus Maple, Sol, Vale |
+| **Model** | `v1.0 舊版` for English/Japanese, or `v1.1-zh` for Chinese |
+| **Voice** | Depends on the selected model |
 | **Speed** | Duration scale (0.5×–2.0×). Values outside 0.7–1.3 may distort prosody |
 | **Output Format** | `wav` or `mp3` |
 | **Text Cleaning** | Lowercase, whitespace, references, initials |
@@ -104,11 +117,16 @@ On some WSL/Windows setups, ports in the 7000–9000 range are reserved. The app
   ```bash
   uv run python -c "import nltk; nltk.download('punkt_tab'); nltk.download('punkt')"
   ```
-* **Chinese voices unavailable:** Install G2P extras, then restart:
+* **Chinese voices unavailable:** Select **v1.1-zh** in **Model**, then install G2P extras and restart:
   ```bash
   uv pip install "misaki[zh]"
   ```
-  This build is **Kokoro v1.1-zh** (English + Mandarin). Japanese and the old v1.0 named voices (Heart, Xiaoxiao, …) are not in this checkpoint.
+  v1.0 has only 8 older Chinese names (Xiaobei, Xiaoxiao, Yunxi, …). The 100 numbered Mandarin voices (`zf_001` / `zm_009`, …) are in **v1.1-zh** only.
+* **Japanese voices unavailable:** Select **v1.0 舊版** (Japanese is not in v1.1-zh), then:
+  ```bash
+  uv pip install "misaki[ja]"
+  uv run python -m unidic download
+  ```
 * **MP3 export fails:** Install `ffmpeg` with `libmp3lame`, or switch **Output Format** to `wav`.
 * **Gradio `InvalidPathError` when returning batch files:** The app allows serving files under your home directory. Restart after updating so `allowed_paths` is applied. Outputs are still written to your chosen folder even if the download widget fails.
 * **Port already in use / empty port range:** Unset a bad `GRADIO_SERVER_PORT`, or set one that can bind, e.g. `GRADIO_SERVER_PORT=17860 python app.py`.

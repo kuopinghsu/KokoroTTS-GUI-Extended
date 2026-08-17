@@ -79,28 +79,129 @@ print(f"DEBUG: Kokoro Version: {kokoro.__version__}")
 print(f"DEBUG: Misaki Version: {misaki.__version__}")
 print(f"DEBUG: Running on {device.upper()}")
 
-# --- MODEL LOADING ---
-# v1.1-zh: Mandarin (55 female zf_*, 45 male zm_*) + 3 English bonus voices.
-# Ref: https://github.com/RapidAI/RapidSpeech.cpp/blob/main/docs/kokoro.md
-# Model: https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh
-REPO_ID = 'hexgrad/Kokoro-82M-v1.1-zh'
+# --- MODEL PRESETS ---
+# v1.0: more English + Japanese (+ older named Chinese voices)
+# v1.1-zh: 100 Mandarin speakers + Maple/Sol/Vale
+# https://huggingface.co/hexgrad/Kokoro-82M
+# https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh
+# https://github.com/RapidAI/RapidSpeech.cpp/blob/main/docs/kokoro.md
 ZH_G2P_VERSION = '1.1'
-print(f"DEBUG: Model repo: {REPO_ID}")
-print("Loading model... this may take a moment.")
-try:
-    model_instance = KModel(repo_id=REPO_ID).to(device).eval()
-except Exception as e:
-    raise RuntimeError(f"Failed to load KModel from {REPO_ID}. Error: {e}")
+LANG_EXTRAS = {'j': 'ja', 'z': 'zh'}
 
-models = {True: model_instance, False: model_instance} # True=GPU, False=CPU request (handled same locally)
+CHOICES_V10 = {
+    '🇺🇸 🚺 Heart ❤️': 'af_heart',
+    '🇺🇸 🚺 Bella 🔥': 'af_bella',
+    '🇺🇸 🚺 Nicole 🎧': 'af_nicole',
+    '🇺🇸 🚺 Aoede': 'af_aoede',
+    '🇺🇸 🚺 Kore': 'af_kore',
+    '🇺🇸 🚺 Sarah': 'af_sarah',
+    '🇺🇸 🚺 Nova': 'af_nova',
+    '🇺🇸 🚺 Sky': 'af_sky',
+    '🇺🇸 🚺 Alloy': 'af_alloy',
+    '🇺🇸 🚺 Jessica': 'af_jessica',
+    '🇺🇸 🚺 River': 'af_river',
+    '🇺🇸 🚹 Michael': 'am_michael',
+    '🇺🇸 🚹 Fenrir': 'am_fenrir',
+    '🇺🇸 🚹 Puck': 'am_puck',
+    '🇺🇸 🚹 Echo': 'am_echo',
+    '🇺🇸 🚹 Eric': 'am_eric',
+    '🇺🇸 🚹 Liam': 'am_liam',
+    '🇺🇸 🚹 Onyx': 'am_onyx',
+    '🇺🇸 🚹 Santa': 'am_santa',
+    '🇺🇸 🚹 Adam': 'am_adam',
+    '🇬🇧 🚺 Emma': 'bf_emma',
+    '🇬🇧 🚺 Isabella': 'bf_isabella',
+    '🇬🇧 🚺 Alice': 'bf_alice',
+    '🇬🇧 🚺 Lily': 'bf_lily',
+    '🇬🇧 🚹 George': 'bm_george',
+    '🇬🇧 🚹 Fable': 'bm_fable',
+    '🇬🇧 🚹 Lewis': 'bm_lewis',
+    '🇬🇧 🚹 Daniel': 'bm_daniel',
+    '🇯🇵 🚺 Alpha': 'jf_alpha',
+    '🇯🇵 🚺 Gongitsune': 'jf_gongitsune',
+    '🇯🇵 🚺 Nezumi': 'jf_nezumi',
+    '🇯🇵 🚺 Tebukuro': 'jf_tebukuro',
+    '🇯🇵 🚹 Kumo': 'jm_kumo',
+    '🇨🇳 🚺 Xiaobei': 'zf_xiaobei',
+    '🇨🇳 🚺 Xiaoni': 'zf_xiaoni',
+    '🇨🇳 🚺 Xiaoxiao': 'zf_xiaoxiao',
+    '🇨🇳 🚺 Xiaoyi': 'zf_xiaoyi',
+    '🇨🇳 🚹 Yunjian': 'zm_yunjian',
+    '🇨🇳 🚹 Yunxi': 'zm_yunxi',
+    '🇨🇳 🚹 Yunxia': 'zm_yunxia',
+    '🇨🇳 🚹 Yunyang': 'zm_yunyang',
+}
 
-# --- FORWARD PASS ---
-def forward_device(ps, ref_s, speed):
-    """Simplified forward pass that uses the globally loaded model."""
-    return models[CUDA_AVAILABLE](ps, ref_s, speed)
+CHOICES_V11 = {
+    '🇺🇸 🚺 Maple': 'af_maple',
+    '🇺🇸 🚺 Sol': 'af_sol',
+    '🇬🇧 🚺 Vale': 'bf_vale',
+}
+for _id in (
+    '001', '002', '003', '004', '005', '006', '007', '008', '017', '018', '019',
+    '021', '022', '023', '024', '026', '027', '028', '032', '036', '038', '039',
+    '040', '042', '043', '044', '046', '047', '048', '049', '051', '059', '060',
+    '067', '070', '071', '072', '073', '074', '075', '076', '077', '078', '079',
+    '083', '084', '085', '086', '087', '088', '090', '092', '093', '094', '099',
+):
+    CHOICES_V11[f'🇨🇳 🚺 {_id}'] = f'zf_{_id}'
+for _id in (
+    '009', '010', '011', '012', '013', '014', '015', '016', '020', '025', '029',
+    '030', '031', '033', '034', '035', '037', '041', '045', '050', '052', '053',
+    '054', '055', '056', '057', '058', '061', '062', '063', '064', '065', '066',
+    '068', '069', '080', '081', '082', '089', '091', '095', '096', '097', '098',
+    '100',
+):
+    CHOICES_V11[f'🇨🇳 🚹 {_id}'] = f'zm_{_id}'
 
-# --- PIPELINE SETUP ---
-LANG_EXTRAS = {'z': 'zh'}
+
+def _voice_groups(choices):
+    groups = {
+        "All": list(choices.items()),
+        "🇺🇸 English (US)": [(k, v) for k, v in choices.items() if v.startswith('a')],
+        "🇬🇧 English (UK)": [(k, v) for k, v in choices.items() if v.startswith('b')],
+    }
+    ja = [(k, v) for k, v in choices.items() if v.startswith('j')]
+    zh = [(k, v) for k, v in choices.items() if v.startswith('z')]
+    if ja:
+        groups["🇯🇵 Japanese"] = ja
+    if zh:
+        groups["🇨🇳 Chinese"] = zh
+    return groups
+
+
+MODEL_PRESETS = {
+    "v1.0": {
+        "label": "v1.0 舊版 · 英文／日文／舊中文",
+        "repo_id": "hexgrad/Kokoro-82M",
+        "choices": CHOICES_V10,
+        "groups": _voice_groups(CHOICES_V10),
+        "default_lang": "🇺🇸 English (US)",
+        "default_voice": "af_heart",
+        "init_langs": "abjz",
+        "subtitle": "v1.0 · 英文／日文較完整 · 24 kHz",
+        "voice_info": "舊版 Kokoro-82M：美／英多聲線、5 個日文、8 個舊中文名。切到 v1.1-zh 才有 100 條中文聲線。",
+    },
+    "v1.1-zh": {
+        "label": "v1.1-zh · 中文 100 聲線",
+        "repo_id": "hexgrad/Kokoro-82M-v1.1-zh",
+        "choices": CHOICES_V11,
+        "groups": _voice_groups(CHOICES_V11),
+        "default_lang": "🇨🇳 Chinese",
+        "default_voice": "zf_001",
+        "init_langs": "abz",
+        "subtitle": "v1.1-zh · 中文為主 · 24 kHz",
+        "voice_info": "v1.1-zh：55 女 + 45 男中文聲線，外加 Maple／Sol／Vale。沒有日文與舊版 Heart／Xiaoxiao 等。",
+    },
+}
+
+DEFAULT_PRESET = "v1.0"
+MODEL_DROPDOWN = [(spec["label"], key) for key, spec in MODEL_PRESETS.items()]
+
+REPO_ID = MODEL_PRESETS[DEFAULT_PRESET]["repo_id"]
+CURRENT_PRESET = None
+model_instance = None
+models = {}
 pipelines = {}
 
 
@@ -129,14 +230,16 @@ def get_pipeline(lang_code):
     if lang_code in pipelines:
         return pipelines[lang_code]
     extra = LANG_EXTRAS.get(lang_code)
+    if lang_code == 'j':
+        _ensure_unidic()
     try:
         pipe = KPipeline(lang_code=lang_code, model=False, repo_id=REPO_ID)
-        if lang_code == 'z':
+        if lang_code == 'z' and not REPO_ID.endswith('/Kokoro-82M'):
             print(f"DEBUG: Chinese G2P is misaki[zh] ZHG2P(version='{ZH_G2P_VERSION}')")
     except ImportError as exc:
         if extra:
             raise ImportError(
-                f"Language '{lang_code}' requires: pip install 'misaki[{extra}]'"
+                f"Language '{lang_code}' requires: uv pip install 'misaki[{extra}]'"
             ) from exc
         raise
     if lang_code == 'a' and hasattr(pipe, 'g2p') and hasattr(pipe.g2p, 'lexicon'):
@@ -147,18 +250,42 @@ def get_pipeline(lang_code):
     return pipe
 
 
-for _lang in 'ab':
-    get_pipeline(_lang)
+def load_checkpoint(preset_id):
+    """Load a Kokoro checkpoint and rebuild language pipelines."""
+    global REPO_ID, CURRENT_PRESET, model_instance, models, pipelines
+    spec = MODEL_PRESETS[preset_id]
+    if CURRENT_PRESET == preset_id and model_instance is not None:
+        return spec
+    print(f"DEBUG: Loading {preset_id} from {spec['repo_id']}...")
+    pipelines.clear()
+    if model_instance is not None:
+        del model_instance
+        models.clear()
+        if CUDA_AVAILABLE:
+            torch.cuda.empty_cache()
+        model_instance = None
+    REPO_ID = spec["repo_id"]
+    model_instance = KModel(repo_id=REPO_ID).to(device).eval()
+    models = {True: model_instance, False: model_instance}
+    CURRENT_PRESET = preset_id
+    for lang in spec["init_langs"]:
+        try:
+            get_pipeline(lang)
+            print(f"DEBUG: Pipeline ready for lang_code='{lang}'")
+        except Exception as exc:
+            extra = LANG_EXTRAS.get(lang, lang)
+            print(f"WARN: lang_code='{lang}' unavailable. uv pip install 'misaki[{extra}]' ({exc})")
+    print(f"DEBUG: Active model: {preset_id} ({REPO_ID})")
+    return spec
 
-for _lang, _extra in LANG_EXTRAS.items():
-    try:
-        get_pipeline(_lang)
-        print(f"DEBUG: Loaded pipeline for lang_code='{_lang}' (misaki[{_extra}])")
-    except Exception as exc:
-        print(
-            f"WARN: Chinese voices unavailable. "
-            f"Install with: uv pip install 'misaki[{_extra}]'  ({exc})"
-        )
+
+print("Loading default model... this may take a moment.")
+load_checkpoint(DEFAULT_PRESET)
+
+
+def forward_device(ps, ref_s, speed):
+    """Simplified forward pass that uses the globally loaded model."""
+    return models[CUDA_AVAILABLE](ps, ref_s, speed)
 
 # --- TEXT CHUNKING HELPERS (Adapted from Chatter.py) ---
 
@@ -905,39 +1032,28 @@ def step_batch_audio(selected_path, written_files, direction):
 
 # --- UI CONFIGURATION ---
 
-CHOICES = {
-    '🇺🇸 🚺 Maple': 'af_maple',
-    '🇺🇸 🚺 Sol': 'af_sol',
-    '🇬🇧 🚺 Vale': 'bf_vale',
-}
-for _id in (
-    '001', '002', '003', '004', '005', '006', '007', '008', '017', '018', '019',
-    '021', '022', '023', '024', '026', '027', '028', '032', '036', '038', '039',
-    '040', '042', '043', '044', '046', '047', '048', '049', '051', '059', '060',
-    '067', '070', '071', '072', '073', '074', '075', '076', '077', '078', '079',
-    '083', '084', '085', '086', '087', '088', '090', '092', '093', '094', '099',
-):
-    CHOICES[f'🇨🇳 🚺 {_id}'] = f'zf_{_id}'
-for _id in (
-    '009', '010', '011', '012', '013', '014', '015', '016', '020', '025', '029',
-    '030', '031', '033', '034', '035', '037', '041', '045', '050', '052', '053',
-    '054', '055', '056', '057', '058', '061', '062', '063', '064', '065', '066',
-    '068', '069', '080', '081', '082', '089', '091', '095', '096', '097', '098',
-    '100',
-):
-    CHOICES[f'🇨🇳 🚹 {_id}'] = f'zm_{_id}'
-
-VOICE_GROUPS = {
-    "All": list(CHOICES.items()),
-    "🇺🇸 English (US)": [(k, v) for k, v in CHOICES.items() if v.startswith('a')],
-    "🇬🇧 English (UK)": [(k, v) for k, v in CHOICES.items() if v.startswith('b')],
-    "🇨🇳 Chinese": [(k, v) for k, v in CHOICES.items() if v.startswith('z')],
-}
-
-
 def voices_for_language(lang):
-    items = VOICE_GROUPS.get(lang) or list(CHOICES.items())
+    spec = MODEL_PRESETS[CURRENT_PRESET or DEFAULT_PRESET]
+    groups = spec["groups"]
+    items = groups.get(lang) or list(spec["choices"].items())
     return gr.update(choices=items, value=items[0][1])
+
+
+def switch_model(preset_id):
+    """Swap checkpoint and refresh language/voice dropdowns."""
+    spec = load_checkpoint(preset_id)
+    groups = spec["groups"]
+    header = f"# Kokoro TTS\n{spec['subtitle']} · **{HARDWARE_BADGE}**"
+    return (
+        header,
+        gr.update(choices=list(groups.keys()), value=spec["default_lang"]),
+        gr.update(
+            choices=groups[spec["default_lang"]],
+            value=spec["default_voice"],
+            info=spec["voice_info"],
+        ),
+    )
+
 
 TOKEN_NOTE = '''💡 Customize pronunciation with Markdown link syntax and /slashes/ like `[Kokoro](/kˈOkəɹO/)`
 💬 To adjust intonation, try punctuation `;:,.!?—…"()“”` or stress `ˈ` and `ˌ`
@@ -1083,15 +1199,16 @@ THEME_DARK_JS = """
 """
 
 HARDWARE_BADGE = "CUDA GPU" if CUDA_AVAILABLE else "CPU"
+_startup = MODEL_PRESETS[DEFAULT_PRESET]
 
 # --- GRADIO INTERFACE ---
 
 with gr.Blocks(title="Kokoro TTS") as app:
     with gr.Row(elem_classes="app-header"):
         with gr.Column(scale=5, elem_classes="brand-title"):
-            gr.Markdown(
+            header_md = gr.Markdown(
                 f"# Kokoro TTS\n"
-                f"v1.1-zh · Mandarin + English · 24 kHz · **{HARDWARE_BADGE}**"
+                f"{_startup['subtitle']} · **{HARDWARE_BADGE}**"
             )
         with gr.Column(scale=2, min_width=220, elem_classes="theme-toggle"):
             with gr.Row():
@@ -1101,17 +1218,23 @@ with gr.Blocks(title="Kokoro TTS") as app:
     with gr.Row(equal_height=True):
         with gr.Column(scale=1, min_width=280, elem_classes="settings-panel"):
             gr.Markdown("### Voice")
+            model_select = gr.Dropdown(
+                MODEL_DROPDOWN,
+                value=DEFAULT_PRESET,
+                label="Model",
+                info="舊版 v1.0 支援較多英文與日文；v1.1-zh 專精中文 100 聲線。切換會重新載入權重。",
+            )
             voice_lang = gr.Dropdown(
-                list(VOICE_GROUPS.keys()),
-                value="🇨🇳 Chinese",
+                list(_startup["groups"].keys()),
+                value=_startup["default_lang"],
                 label="Language",
             )
             voice = gr.Dropdown(
-                VOICE_GROUPS["🇨🇳 Chinese"],
-                value='zf_001',
+                _startup["groups"][_startup["default_lang"]],
+                value=_startup["default_voice"],
                 label='Voice',
                 filterable=True,
-                info='v1.1-zh: 55 female (zf_*) + 45 male (zm_*) Mandarin voices, plus Maple / Sol / Vale. Language follows the selected voice (misaki[zh] G2P 1.1).',
+                info=_startup["voice_info"],
             )
             speed = gr.Slider(
                 minimum=0.5, maximum=2, value=1, step=0.1, label='Speed',
@@ -1153,7 +1276,7 @@ with gr.Blocks(title="Kokoro TTS") as app:
                     text = gr.Textbox(
                         label='Input text',
                         lines=8,
-                        value="你好，世界，今天天气真好。",
+                        value="Hello, this is Kokoro. Choose v1.0 for English and Japanese, or v1.1-zh for Chinese voices.",
                     )
                     with gr.Row():
                         zh_sample_btn = gr.Button('中文示例', variant='secondary')
@@ -1237,6 +1360,11 @@ with gr.Blocks(title="Kokoro TTS") as app:
                             )
 
     # Event Handlers — Single Text
+    model_select.change(
+        fn=switch_model,
+        inputs=[model_select],
+        outputs=[header_md, voice_lang, voice],
+    )
     voice_lang.change(fn=voices_for_language, inputs=[voice_lang], outputs=[voice])
     light_btn.click(fn=None, js=THEME_LIGHT_JS)
     dark_btn.click(fn=None, js=THEME_DARK_JS)
