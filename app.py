@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import torch
 import time
 from pathlib import Path
@@ -411,32 +412,53 @@ def prepare_text(text, voice, clean_lowercase, clean_whitespace, clean_reference
     return group_sentences(sentences, max_chars=max_chars, joiner=joiner)
 
 
+# eSpeak G2P and CUDA forward are not thread-safe. Parallel workers must serialize.
+_PIPELINE_LOCK = threading.Lock()
+
+
+def _synthesize_phonemes(ps, pack, speed, index):
+    if not ps:
+        return None
+    ref_s_index = len(ps) - 1
+    if ref_s_index >= len(pack):
+        log_progress(
+            f"ref_s index {ref_s_index} out of bounds for pack length {len(pack)} "
+            f"in chunk {index+1}. Using last element.",
+            "WARN",
+        )
+        ref_s_index = len(pack) - 1
+    return forward_device(ps, pack[ref_s_index], speed)
+
+
 def process_chunk(chunk_text, index, voice, speed):
     """Processes a single chunk of text to generate audio."""
     try:
-        pipeline = get_pipeline(voice[0])
-        pack = pipeline.load_voice(voice)
-
-        chunk_text = chunk_text.strip()
+        chunk_text = (chunk_text or "").strip()
         if not chunk_text:
             return index, None, None
 
-        processed_chunk = next(pipeline(chunk_text, voice, speed), None)
-        if processed_chunk is None:
+        pipeline = get_pipeline(voice[0])
+        audios = []
+        phonemes = []
+        with _PIPELINE_LOCK:
+            pack = pipeline.load_voice(voice)
+            # split_pattern=None: this function already receives a chunk. Collect
+            # every en_tokenize window (the model cap is 510 phonemes).
+            for result in pipeline(chunk_text, voice=voice, speed=speed, split_pattern=None):
+                ps = result.phonemes
+                if not ps:
+                    continue
+                phonemes.append(str(ps))
+                audio = _synthesize_phonemes(ps, pack, speed, index)
+                if audio is not None:
+                    audios.append(audio)
+
+        if not audios:
             log_progress(f"Pipeline returned no output for chunk {index+1}.", "WARN")
             return index, None, None
 
-        _, ps, _ = processed_chunk
-
-        ref_s_index = len(ps) - 1
-        if ref_s_index >= len(pack):
-            log_progress(f"ref_s index {ref_s_index} out of bounds for pack length {len(pack)} in chunk {index+1}. Using last element.", "WARN")
-            ref_s_index = len(pack) - 1
-        
-        ref_s = pack[ref_s_index]
-
-        audio = forward_device(ps, ref_s, speed)
-        return index, audio, str(ps)
+        audio = audios[0] if len(audios) == 1 else torch.cat([a.cpu() for a in audios])
+        return index, audio, "\n".join(phonemes)
     except Exception as e:
         log_progress(f"Audio generation failed for chunk {index+1}: {e}", "ERROR")
         return index, None, None
@@ -460,29 +482,54 @@ def generate_first(text, voice, speed, use_gpu, clean_lowercase, clean_whitespac
     chunks = prepare_text(
         text, voice, clean_lowercase, clean_whitespace, clean_references, clean_initials
     )
-    log_progress(f"Text divided into {len(chunks)} chunks for parallel processing.", "DEBUG")
+    log_progress(f"Text divided into {len(chunks)} chunks for processing.", "DEBUG")
+    for i, chunk in enumerate(chunks):
+        preview = chunk if len(chunk) <= 80 else chunk[:77] + "..."
+        log_progress(f"  chunk {i+1}/{len(chunks)} ({len(chunk)} chars): {preview}", "DEBUG")
 
     results = [None] * len(chunks)
-    
-    with ThreadPoolExecutor(max_workers=int(parallel_chunks)) as executor:
-        log_progress(f"Submitting {len(chunks)} chunks to thread pool ({int(parallel_chunks)} workers)...", "DEBUG")
+    workers = max(1, int(parallel_chunks) if parallel_chunks else 1)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        log_progress(f"Submitting {len(chunks)} chunks to thread pool ({workers} workers)...", "DEBUG")
         futures = [executor.submit(process_chunk, chunk, i, voice, speed) for i, chunk in enumerate(chunks)]
-        
+
         completed_count = 0
         for future in as_completed(futures):
             completed_count += 1
             index, audio, ps = future.result()
             if audio is not None:
                 results[index] = (audio, ps)
+            else:
+                log_progress(f"Chunk {index+1} produced no audio.", "WARN")
             log_progress(f"Completed chunk processing: {completed_count}/{len(chunks)}.", "INFO")
 
+    # CUDA / eSpeak races can drop a later chunk (this file's 3rd chunk starts at
+    # "Compare becomes available..."). Retry any gaps serially.
+    for i, res in enumerate(results):
+        if res is not None:
+            continue
+        log_progress(f"Retrying chunk {i+1} serially...", "WARN")
+        _, audio, ps = process_chunk(chunks[i], i, voice, speed)
+        if audio is not None:
+            results[i] = (audio, ps)
+        else:
+            log_progress(f"Chunk {i+1} skipped after retry: {chunks[i][:120]!r}", "ERROR")
+
     log_progress("Collating results...", "DEBUG")
+    missing = [i + 1 for i, res in enumerate(results) if res is None]
     all_audio = [res[0] for res in results if res]
     all_ps = [res[1] for res in results if res]
 
     if not all_audio:
         log_progress("No audio was generated for any chunk.", "ERROR")
         return None, ''
+
+    if missing:
+        log_progress(
+            f"Output is incomplete; skipped chunk(s) {missing} of {len(chunks)}.",
+            "ERROR",
+        )
 
     log_progress("Concatenating audio chunks...", "INFO")
     silence = torch.zeros(int(24000 * 0.25))  # Silence on CPU
@@ -494,7 +541,7 @@ def generate_first(text, voice, speed, use_gpu, clean_lowercase, clean_whitespac
 
     final_audio = torch.cat(final_audio_list)
     final_ps = "\n---\n".join(all_ps)
-    
+
     log_progress("Generation finished successfully.", "INFO")
     return (24000, final_audio.numpy()), final_ps
 
