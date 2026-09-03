@@ -294,8 +294,21 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r'\s{2,}', ' ', text.strip())
 
 def remove_inline_reference_numbers(text):
-    # Removes bracketed or superscript-style reference numbers (e.g., [1], .”3)
-    return re.sub(r'([.!?,\"\'”’)\]])(\d+)(?=\s|$)', r'\1', text)
+    """Remove footnote-style numbers after punctuation (e.g. end.3, .”3).
+
+    Keep decimal values such as 2.521 or .5 — the old pattern turned
+    "2.521 seconds" into "2. seconds", which Kokoro reads as "two [pause] seconds".
+    """
+    def _keep_or_strip(match):
+        punct = match.group(1)
+        if punct == '.':
+            i = match.start()
+            prev = text[i - 1] if i > 0 else ''
+            if prev.isdigit() or prev.isspace() or prev == '':
+                return match.group(0)
+        return punct
+
+    return re.sub(r'([.!?,\"\'”’)\]])(\d+)(?=\s|$)', _keep_or_strip, text)
 
 def replace_letter_period_sequences(text: str) -> str:
     # Converts "J.R.R." to "J R R"
@@ -393,6 +406,45 @@ def split_sentences(text, lang_code):
     return sent_tokenize(text)
 
 
+PAUSE_MARKER_RE = re.compile(
+    r'\.{3,}|…+|\[pause(?::\s*(\d+(?:\.\d+)?)\s*s?)?\]',
+    re.IGNORECASE,
+)
+PAUSE_SAMPLE_RATE = 24000
+CHUNK_GAP_SEC = 0.25
+
+
+def _pause_seconds(match):
+    token = match.group(0)
+    if token.lower().startswith('[pause'):
+        seconds = float(match.group(1)) if match.group(1) else 0.5
+        return min(5.0, max(0.15, seconds))
+    if '…' in token:
+        return min(5.0, 0.5 * len(token))
+    # "..." ≈ 0.6s, "......" ≈ 1.2s
+    return min(5.0, max(0.4, 0.2 * len(token)))
+
+
+def split_text_on_pauses(text):
+    """Split text on '...' / '……' / '[pause]' / '[pause:1.5]'.
+
+    Returns [(segment, pause_after_seconds), ...]. Kokoro ignores extra periods,
+    so these markers are turned into real silence later.
+    """
+    pieces = []
+    last = 0
+    for match in PAUSE_MARKER_RE.finditer(text):
+        pieces.append((text[last:match.start()], _pause_seconds(match)))
+        last = match.end()
+    pieces.append((text[last:], 0.0))
+    return pieces
+
+
+def silence_tensor(seconds):
+    n = max(0, int(PAUSE_SAMPLE_RATE * float(seconds)))
+    return torch.zeros(n)
+
+
 def prepare_text(text, voice, clean_lowercase, clean_whitespace, clean_references, clean_initials):
     """Apply cleaning and chunking appropriate for the selected voice language."""
     lang_code = voice[0]
@@ -465,27 +517,10 @@ def process_chunk(chunk_text, index, voice, speed):
 
 # --- GENERATION FUNCTIONS ---
 
-def generate_first(text, voice, speed, use_gpu, clean_lowercase, clean_whitespace, clean_references, clean_initials, parallel_chunks):
-    """
-    Generates audio for the given text. For long text, it splits it into chunks,
-    generates audio for each in parallel, and concatenates them.
-    """
-    log_progress("Generation started.", "INFO")
-    text = text.strip()
-    if not text:
-        log_progress("Input text is empty. Aborting.", "WARN")
-        return None, ''
-
-    # --- Apply text cleaning ---
-    log_progress("Applying text cleaning options...", "DEBUG")
-    log_progress("Splitting text into sentences and grouping into chunks...")
-    chunks = prepare_text(
-        text, voice, clean_lowercase, clean_whitespace, clean_references, clean_initials
-    )
-    log_progress(f"Text divided into {len(chunks)} chunks for processing.", "DEBUG")
-    for i, chunk in enumerate(chunks):
-        preview = chunk if len(chunk) <= 80 else chunk[:77] + "..."
-        log_progress(f"  chunk {i+1}/{len(chunks)} ({len(chunk)} chars): {preview}", "DEBUG")
+def generate_chunk_audio(chunks, voice, speed, parallel_chunks):
+    """Synthesize a list of text chunks; retry any failed chunk serially."""
+    if not chunks:
+        return [], []
 
     results = [None] * len(chunks)
     workers = max(1, int(parallel_chunks) if parallel_chunks else 1)
@@ -504,8 +539,6 @@ def generate_first(text, voice, speed, use_gpu, clean_lowercase, clean_whitespac
                 log_progress(f"Chunk {index+1} produced no audio.", "WARN")
             log_progress(f"Completed chunk processing: {completed_count}/{len(chunks)}.", "INFO")
 
-    # CUDA / eSpeak races can drop a later chunk (this file's 3rd chunk starts at
-    # "Compare becomes available..."). Retry any gaps serially.
     for i, res in enumerate(results):
         if res is not None:
             continue
@@ -516,34 +549,85 @@ def generate_first(text, voice, speed, use_gpu, clean_lowercase, clean_whitespac
         else:
             log_progress(f"Chunk {i+1} skipped after retry: {chunks[i][:120]!r}", "ERROR")
 
-    log_progress("Collating results...", "DEBUG")
     missing = [i + 1 for i, res in enumerate(results) if res is None]
-    all_audio = [res[0] for res in results if res]
-    all_ps = [res[1] for res in results if res]
-
-    if not all_audio:
-        log_progress("No audio was generated for any chunk.", "ERROR")
-        return None, ''
-
     if missing:
         log_progress(
             f"Output is incomplete; skipped chunk(s) {missing} of {len(chunks)}.",
             "ERROR",
         )
+    all_audio = [res[0] for res in results if res]
+    all_ps = [res[1] for res in results if res]
+    return all_audio, all_ps
+
+
+def _concat_audio(pieces, gap_sec=0.0):
+    if not pieces:
+        return None
+    gap = silence_tensor(gap_sec) if gap_sec > 0 else None
+    out = []
+    for i, audio in enumerate(pieces):
+        out.append(audio.cpu())
+        if gap is not None and i < len(pieces) - 1:
+            out.append(gap)
+    return torch.cat(out)
+
+
+def generate_first(text, voice, speed, use_gpu, clean_lowercase, clean_whitespace, clean_references, clean_initials, parallel_chunks):
+    """
+    Generates audio for the given text. For long text, it splits it into chunks,
+    generates audio for each in parallel, and concatenates them.
+    """
+    log_progress("Generation started.", "INFO")
+    text = text.strip()
+    if not text:
+        log_progress("Input text is empty. Aborting.", "WARN")
+        return None, ''
+
+    pause_parts = split_text_on_pauses(text)
+    pause_count = sum(1 for _, pause in pause_parts if pause > 0)
+    if pause_count:
+        log_progress(f"Found {pause_count} pause marker(s) (ellipsis or [pause]).", "INFO")
+
+    log_progress("Applying text cleaning options...", "DEBUG")
+    final_audio_list = []
+    all_ps = []
+
+    for part_index, (segment, pause_after) in enumerate(pause_parts):
+        segment = segment.strip()
+        if segment:
+            log_progress("Splitting text into sentences and grouping into chunks...")
+            chunks = prepare_text(
+                segment, voice, clean_lowercase, clean_whitespace, clean_references, clean_initials
+            )
+            log_progress(
+                f"Part {part_index+1}/{len(pause_parts)}: {len(chunks)} chunk(s).",
+                "DEBUG",
+            )
+            for i, chunk in enumerate(chunks):
+                preview = chunk if len(chunk) <= 80 else chunk[:77] + "..."
+                log_progress(f"  chunk {i+1}/{len(chunks)} ({len(chunk)} chars): {preview}", "DEBUG")
+
+            part_audio, part_ps = generate_chunk_audio(chunks, voice, speed, parallel_chunks)
+            joined = _concat_audio(part_audio, CHUNK_GAP_SEC)
+            if joined is not None:
+                final_audio_list.append(joined)
+                all_ps.extend(part_ps)
+
+        if pause_after > 0:
+            log_progress(f"Inserting {pause_after:.2f}s pause.", "INFO")
+            final_audio_list.append(silence_tensor(pause_after))
+            all_ps.append(f"[pause {pause_after:.2f}s]")
+
+    if not final_audio_list:
+        log_progress("No audio was generated for any chunk.", "ERROR")
+        return None, ''
 
     log_progress("Concatenating audio chunks...", "INFO")
-    silence = torch.zeros(int(24000 * 0.25))  # Silence on CPU
-    final_audio_list = []
-    for i, audio_chunk in enumerate(all_audio):
-        final_audio_list.append(audio_chunk.cpu())
-        if i < len(all_audio) - 1:
-            final_audio_list.append(silence)
-
-    final_audio = torch.cat(final_audio_list)
+    final_audio = torch.cat([a.cpu() for a in final_audio_list])
     final_ps = "\n---\n".join(all_ps)
 
     log_progress("Generation finished successfully.", "INFO")
-    return (24000, final_audio.numpy()), final_ps
+    return (PAUSE_SAMPLE_RATE, final_audio.numpy()), final_ps
 
 def tokenize_first(text, voice, clean_lowercase, clean_whitespace, clean_references, clean_initials):
     text = text.strip()
@@ -1103,6 +1187,7 @@ def switch_model(preset_id):
 
 
 TOKEN_NOTE = '''💡 Customize pronunciation with Markdown link syntax and /slashes/ like `[Kokoro](/kˈOkəɹO/)`
+⏸️ Pause: `...` (≈0.6s), `......` (≈1.2s), or `[pause]` / `[pause:1.5]` (seconds, max 5)
 💬 To adjust intonation, try punctuation `;:,.!?—…"()“”` or stress `ˈ` and `ˌ`
 ⬇️ Lower stress `[1 level](-1)` or `[2 levels](-2)`
 ⬆️ Raise stress 1 level `[or](+2)` 2 levels (only works on less stressed, usually short words)'''
@@ -1302,7 +1387,11 @@ with gr.Blocks(title="Kokoro TTS") as app:
             with gr.Accordion("Text cleaning", open=False):
                 clean_lowercase = gr.Checkbox(label="Convert to lowercase", value=True)
                 clean_whitespace = gr.Checkbox(label="Normalize whitespace", value=True)
-                clean_references = gr.Checkbox(label="Remove reference numbers", value=True)
+                clean_references = gr.Checkbox(
+                    label="Remove reference numbers",
+                    value=True,
+                    info="Strips footnote digits like end.3. Decimal numbers such as 2.521 are kept.",
+                )
                 clean_initials = gr.Checkbox(label="Format initials (J.R.R.)", value=True)
             with gr.Accordion("Performance", open=False):
                 parallel_chunks = gr.Slider(

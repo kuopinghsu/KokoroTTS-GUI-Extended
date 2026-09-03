@@ -12,7 +12,7 @@ See the [RapidSpeech Kokoro guide](https://github.com/RapidAI/RapidSpeech.cpp/bl
 ## Features
 
 * **Two checkpoints** — switch in the UI:
-  * **v1.0 舊版** (`hexgrad/Kokoro-82M`): more US/UK English + Japanese + 8 older Chinese names
+  * **v1.0** (`hexgrad/Kokoro-82M`): more US/UK English + Japanese + 8 older Chinese names
   * **v1.1-zh** (`hexgrad/Kokoro-82M-v1.1-zh`): 55 female + 45 male Mandarin voices, plus Maple / Sol / Vale
 * **Chinese G2P (v1.1-zh)** — `misaki[zh]` `ZHG2P(version='1.1')`
 * **Single Text tab** — type or drag-and-drop a `.txt` / `.md` file
@@ -22,6 +22,7 @@ See the [RapidSpeech Kokoro guide](https://github.com/RapidAI/RapidSpeech.cpp/bl
 * **Parallel processing** — long text is split into chunks and processed on multiple threads
 * **Hardware acceleration** — uses NVIDIA CUDA when available, otherwise CPU
 * **Text preprocessing** — lowercase, whitespace normalize, reference-number removal, initials formatting
+* **Pauses** — `...`, `......`, `[pause]`, or `[pause:1.5]` insert real silence (Kokoro ignores extra periods on its own)
 * **Tokenization preview** — inspect phonemes before synthesis
 * **Sample library** — 中文示例, Random Quote, Gatsby, Frankenstein
 
@@ -76,7 +77,7 @@ See the [RapidSpeech Kokoro guide](https://github.com/RapidAI/RapidSpeech.cpp/bl
 2. The UI opens in your browser. Shared controls (model, voice, speed, cleaning, parallel chunks, output format) apply to both tabs.
 
 3. **Choose a checkpoint** with the **Model** dropdown (left panel):
-   * **v1.0 舊版** — Heart, Bella, Emma, Japanese Alpha / Kumo, older Xiaoxiao / Yunxi, …
+   * **v1.0** — Heart, Bella, Emma, Japanese Alpha / Kumo, older Xiaoxiao / Yunxi, …
    * **v1.1-zh** — 55 female (`zf_*`) + 45 male (`zm_*`) Mandarin voices, plus Maple / Sol / Vale
    Switching reloads weights (first time downloads from Hugging Face). Then pick **Language** and **Voice**.
 
@@ -85,6 +86,27 @@ See the [RapidSpeech Kokoro guide](https://github.com/RapidAI/RapidSpeech.cpp/bl
 * Enter text, or drag a `.txt` / `.md` file onto the drop zone
 * Click **Generate** — preview plays in the UI; a downloadable WAV/MP3 appears below
 * Use **Tokenize** to inspect phonemes
+
+### Pauses
+
+Kokoro does not treat extra periods as a long stop. This UI turns pause markers into **real silence** in the audio (Single and Batch):
+
+| Marker | Silence |
+|---|---|
+| `...` | ≈ 0.6s |
+| `......` | ≈ 1.2s (0.2s per `.`, max 5s) |
+| `…` / `……` | ≈ 0.5s per ellipsis character |
+| `[pause]` | 0.5s |
+| `[pause:1.5]` | 1.5s (`[pause:2s]` also works; min 0.15s, max 5s) |
+
+```text
+The trace is 2.521 seconds long......it contains eight cores and 163 tasks.
+The trace is 2.521 seconds long [pause:1.5] it contains eight cores and 163 tasks.
+```
+
+Commas, semicolons, and a single period only change intonation; they are not a timed pause. Extra spaces or blank lines are collapsed when **Normalize whitespace** is on, so they do not add silence either.
+
+Decimal numbers such as `2.521` are kept even with **Remove reference numbers** enabled (that option only strips footnote-style digits like `paper.3`).
 
 ### Batch Files
 
@@ -101,7 +123,7 @@ See the [RapidSpeech Kokoro guide](https://github.com/RapidAI/RapidSpeech.cpp/bl
 
 | Control | Description |
 |---|---|
-| **Model** | `v1.0 舊版` for English/Japanese, or `v1.1-zh` for Chinese |
+| **Model** | `v1.0` for English/Japanese, or `v1.1-zh` for Chinese |
 | **Voice** | Depends on the selected model |
 | **Speed** | Duration scale (0.5×–2.0×). Values outside 0.7–1.3 may distort prosody |
 | **Output Format** | `wav` or `mp3` |
@@ -122,7 +144,7 @@ On some WSL/Windows setups, ports in the 7000–9000 range are reserved. The app
   uv pip install "misaki[zh]"
   ```
   v1.0 has only 8 older Chinese names (Xiaobei, Xiaoxiao, Yunxi, …). The 100 numbered Mandarin voices (`zf_001` / `zm_009`, …) are in **v1.1-zh** only.
-* **Japanese voices unavailable:** Select **v1.0 舊版** (Japanese is not in v1.1-zh), then:
+* **Japanese voices unavailable:** Select **v1.0** (Japanese is not in v1.1-zh), then:
   ```bash
   uv pip install "misaki[ja]"
   uv run python -m unidic download
